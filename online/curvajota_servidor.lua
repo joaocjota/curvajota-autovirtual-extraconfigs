@@ -14,6 +14,8 @@ local cfg = ac.configValues({
 
 local foraHa = 0
 
+ac.log('[CURVAJOTA] script do servidor carregado')
+
 local function pilotando(sim)
   if sim.isReplayActive then return false end
   if sim.focusedCar ~= 0 then return false end
