@@ -55,6 +55,7 @@ local solidas = {}                -- peças sólidas na pista, em ordem de chega
 local fisicaOk = nil              -- nil = ainda não testado
 local sessao = -1
 local procura = 0
+local semArquivo = {}          -- caminhos de kn5 que o CSP não carregou
 
 log('carregado; physics.allowed =', physics.allowed and physics.allowed() or 'sem physics')
 
@@ -95,11 +96,23 @@ local function solidificar(no, carIndex, id, P)
     return false
   end
   fisicaOk = true
-  local okM, model = pcall(cena.loadKN5, cena, pasta .. P.arq)
-  if not okM or model == nil then
-    log('nao achei a copia da peca', pasta .. P.arq, model)
+  -- script de pista só lê arquivos da pasta da pista: a cópia fica em <pista>/extension/cj_detritos/<carro>/ (ou
+  -- cj_detritos/ direto); a pasta do carro fica por último (script online pode conseguir ler)
+  local cid = ac.getCarID(carIndex) or ''
+  local dir = (__dirname or '.')
+  local tentativas = { dir .. '/cj_detritos/' .. cid .. '/' .. P.arq, dir .. '/cj_detritos/' .. P.arq, pasta .. P.arq }
+  local model, usado = nil, nil
+  for _, arq in ipairs(tentativas) do
+    if not semArquivo[arq] then
+      local okM, m = pcall(cena.loadKN5, cena, arq)
+      if okM and m ~= nil then model, usado = m, arq break end
+      semArquivo[arq] = true
+      log('nao consegui carregar', arq, m)
+    end
+  end
+  if model == nil then
     pcall(body.dispose, body)
-    return false
+    return nil      -- nil = desiste desta peça (não tenta de novo a cada 0,3 s)
   end
   pcall(body.setDamping, body, cfg.amortecimento, cfg.amortecimento, true)
   body:setTransformation(W)
@@ -111,7 +124,7 @@ local function solidificar(no, carIndex, id, P)
   body:onCollision(function(ci)
     if ci ~= nil then log('carro', ci, 'acertou', id, string.format('%.0f km/h', body:getSpeedKmh())) end
   end)
-  log('peca solida:', id, 'do carro', carIndex, 'em', W.position)
+  log('peca solida:', id, 'do carro', carIndex, 'em', W.position, 'kn5', usado)
   return true
 end
 
@@ -143,7 +156,10 @@ local function procurar(dt)
               vistos[chave] = v
             elseif (pos - v.pos):length() < 0.01 then
               v.parado = v.parado + dt
-              if v.parado > 0.3 then v.feito = solidificar(no, i, id, P) or (fisicaOk == false) end
+              if v.parado > 0.3 then
+                local r = solidificar(no, i, id, P)
+                v.feito = (r ~= false) or (fisicaOk == false)     -- true = sólida; nil = sem cópia, desiste
+              end
             else
               v.parado, v.pos = 0, pos
             end
