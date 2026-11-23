@@ -57,7 +57,7 @@ local sessao = -1
 local procura = 0
 local semArquivo = {}          -- caminhos de kn5 que o CSP não carregou
 
-log('carregado; physics.allowed =', physics.allowed and physics.allowed() or 'sem physics')
+log('carregado; physics.allowed =', physics ~= nil and physics.allowed ~= nil and tostring(physics.allowed()) or 'sem physics', 'online =', tostring(ac.getSim().isOnline))
 
 local function criarMarca()
   if marca ~= nil or carsRoot == nil or carsRoot:size() == 0 then return end
@@ -100,7 +100,8 @@ local function solidificar(no, carIndex, id, P)
   -- cj_detritos/ direto); a pasta do carro fica por último (script online pode conseguir ler)
   local cid = ac.getCarID(carIndex) or ''
   local dir = (__dirname or '.')
-  local tentativas = { dir .. '/cj_detritos/' .. cid .. '/' .. P.arq, dir .. '/cj_detritos/' .. P.arq, pasta .. P.arq }
+  local pistaExt = ac.getFolder(ac.FolderID.ContentTracks) .. '/' .. (ac.getTrackID() or '') .. '/extension/cj_detritos/'
+  local tentativas = { dir .. '/cj_detritos/' .. cid .. '/' .. P.arq, dir .. '/cj_detritos/' .. P.arq, pistaExt .. P.arq, pasta .. P.arq }
   local model, usado = nil, nil
   for _, arq in ipairs(tentativas) do
     if not semArquivo[arq] then
@@ -129,43 +130,58 @@ local function solidificar(no, carIndex, id, P)
 end
 
 -- procura nós de peças soltas dos carros detritos (4 vezes por segundo)
+local function tratarNo(no, nome, i, id, P, chave, dt)
+  local v = vistos[chave]
+  -- isVisible() só vale para malhas (em nó sempre dá false); para nó o certo é isActive()
+  local ativo = true
+  if no.isActive ~= nil then ativo = no:isActive() end
+  if ativo then
+    local pos = no:getWorldTransformationRaw().position:clone()
+    if v == nil then log('achei peca solta:', nome, 'em', pos) end
+    if v ~= nil and v.feito then
+      -- já virou sólida: só conta de novo se o nó saiu do lugar (peça nova caindo depois de um reparo)
+      if (pos - v.pos):length() > 0.3 then vistos[chave] = { pos = pos, parado = 0, feito = false } end
+    elseif v == nil then
+      vistos[chave] = { pos = pos, parado = 0, feito = false }
+    elseif (pos - v.pos):length() < 0.01 then
+      v.parado = v.parado + dt
+      if v.parado > 0.3 then
+        local r = solidificar(no, i, id, P)
+        v.feito = (r ~= false) or (fisicaOk == false)     -- true = sólida; nil = sem cópia, desiste
+      end
+    else
+      v.parado, v.pos = 0, pos
+    end
+  elseif v ~= nil and not v.feito then
+    vistos[chave] = nil
+  end
+end
+
+-- procura nós de peças soltas (4 vezes por segundo). Os nós ficam DIRETO em carsRoot (esferas criadas pelo script do
+-- carro), então basta olhar os filhos diretos: buscar por nome na árvore inteira (findNodes) custava ~400 ms com 18
+-- carros no servidor (teste de 23/11).
+local carroOk = {}
 local function procurar(dt)
-  local sim = ac.getSim()
-  for i = 0, sim.carsCount - 1 do
-    local cid = ac.getCarID(i)
-    if cid ~= nil and cid:find(cfg.carros, 1, true) then
-      for _, id in ipairs(IDS) do
-        local P = PECAS[id]
-        local nome = P.no and ('P500_' .. P.no .. '_' .. i) or ('P500_SOLTA_' .. i .. '_' .. id)
-        local nos = carsRoot:findNodes(nome)
-        for k = 1, nos:size() do
-          local no = nos:at(k)
-          local chave = nome .. '#' .. k
-          local v = vistos[chave]
-          -- isVisible() só vale para malhas (em nó sempre dá false); para nó o certo é isActive()
-          local ativo = true
-          if no.isActive ~= nil then ativo = no:isActive() end
-          if ativo then
-            local pos = no:getWorldTransformationRaw().position:clone()
-            if v == nil then log('achei peca solta:', nome, 'em', pos) end
-            if v ~= nil and v.feito then
-              -- já virou sólida: só conta de novo se o nó saiu do lugar (peça nova caindo depois de um reparo)
-              if (pos - v.pos):length() > 0.3 then vistos[chave] = { pos = pos, parado = 0, feito = false } end
-            elseif v == nil then
-              v = { pos = pos, parado = 0, feito = false }
-              vistos[chave] = v
-            elseif (pos - v.pos):length() < 0.01 then
-              v.parado = v.parado + dt
-              if v.parado > 0.3 then
-                local r = solidificar(no, i, id, P)
-                v.feito = (r ~= false) or (fisicaOk == false)     -- true = sólida; nil = sem cópia, desiste
-              end
-            else
-              v.parado, v.pos = 0, pos
-            end
-          elseif v ~= nil and not v.feito then
-            vistos[chave] = nil
-          end
+  local filhos = carsRoot:getChildren()
+  local n = filhos:size()
+  local cont = {}
+  for k = 1, n do
+    local nome = filhos:name(k)
+    if nome ~= nil and nome:sub(1, 5) == 'P500_' then
+      local i, id = nome:match('^P500_SOLTA_(%d+)_(.+)$')
+      if i == nil then
+        i = nome:match('^P500_WING_FALL_(%d+)$')
+        if i ~= nil then id = 'asa' end
+      end
+      if i ~= nil and PECAS[id] ~= nil then
+        i = tonumber(i)
+        if carroOk[i] == nil then
+          local cid = ac.getCarID(i)
+          carroOk[i] = cid ~= nil and cid:find(cfg.carros, 1, true) ~= nil
+        end
+        if carroOk[i] then
+          cont[nome] = (cont[nome] or 0) + 1
+          tratarNo(filhos:at(k), nome, i, id, PECAS[id], nome .. '#' .. cont[nome], dt)
         end
       end
     end
@@ -173,7 +189,12 @@ local function procurar(dt)
 end
 
 local espera = 3   -- s depois de carregar antes de mexer na cena dos carros
+-- sem permissão de física (ex.: script de PISTA online, onde o CSP não libera) o script não faz nada: as peças ficam só
+-- visuais, como no script do carro. Online quem faz as peças sólidas é a cópia deste arquivo carregada pelo servidor.
+local desligado = physics == nil or physics.allowed == nil or not physics.allowed()
+if desligado then log('sem permissao de fisica aqui: script parado (pecas ficam so visuais)') end
 function script.update(dt)
+  if desligado then return end
   if espera > 0 then espera = espera - dt return end
   local sim = ac.getSim()
   if sim.currentSessionIndex ~= sessao then
