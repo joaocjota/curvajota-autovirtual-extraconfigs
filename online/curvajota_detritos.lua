@@ -129,9 +129,16 @@ local function procurar(dt)
           local no = nos:at(k)
           local chave = nome .. '#' .. k
           local v = vistos[chave]
-          if no:isVisible() then
+          -- isVisible() só vale para malhas (em nó sempre dá false); para nó o certo é isActive()
+          local ativo = true
+          if no.isActive ~= nil then ativo = no:isActive() end
+          if ativo then
             local pos = no:getWorldTransformationRaw().position:clone()
-            if v == nil or v.feito then
+            if v == nil then log('achei peca solta:', nome, 'em', pos) end
+            if v ~= nil and v.feito then
+              -- já virou sólida: só conta de novo se o nó saiu do lugar (peça nova caindo depois de um reparo)
+              if (pos - v.pos):length() > 0.3 then vistos[chave] = { pos = pos, parado = 0, feito = false } end
+            elseif v == nil then
               v = { pos = pos, parado = 0, feito = false }
               vistos[chave] = v
             elseif (pos - v.pos):length() < 0.01 then
