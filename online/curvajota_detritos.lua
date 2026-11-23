@@ -57,7 +57,7 @@ local sessao = -1
 local procura = 0
 local semArquivo = {}          -- caminhos de kn5 que o CSP não carregou
 
-log('carregado; physics.allowed =', physics ~= nil and physics.allowed ~= nil and tostring(physics.allowed()) or 'sem physics', 'online =', tostring(ac.getSim().isOnline))
+log('carregado; physics.allowed =', physics ~= nil and physics.allowed ~= nil and tostring(physics.allowed()) or 'sem physics')
 
 local function criarMarca()
   if marca ~= nil or carsRoot == nil or carsRoot:size() == 0 then return end
