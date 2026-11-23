@@ -16,7 +16,7 @@ REQUIRED = 1
 [SCRIPT_...]
 SCRIPT = "https://raw.githubusercontent.com/joaocjota/curvajota-autovirtual-extraconfigs/main/online/curvajota_detritos.lua"
 REQUIRED = 0
-MAX_PECAS = 40
+maxPecas = 40
 ```
 
-Ajustes (todos opcionais): `CARROS` (trecho do nome da pasta, padrão `_detritos`), `MAX_PECAS`, `MASSA` (multiplicador), `AMORTECIMENTO`, `DEPURAR` (1 mostra a caixa de colisão), `LOG`. No log do CSP as linhas começam com `[CJ_DETRITOS]`.
+Ajustes (todos opcionais): `carros` (trecho do nome da pasta, padrão `_detritos`), `maxPecas`, `massa` (multiplicador), `amortecimento`, `depurar` (1 mostra a caixa de colisão), `log`. No log do CSP as linhas começam com `[CJ_DETRITOS]`.
