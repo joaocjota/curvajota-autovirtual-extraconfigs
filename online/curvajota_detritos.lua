@@ -60,8 +60,10 @@ log('carregado; physics.allowed =', physics.allowed and physics.allowed() or 'se
 
 local function criarMarca()
   if marca ~= nil or carsRoot == nil or carsRoot:size() == 0 then return end
-  local ok, n = pcall(carsRoot.createNode, carsRoot, 'CJ_DETRITOS_SERVIDOR', false)
-  if ok and n ~= nil then marca = n end
+  -- carsRoot só aceita nós de esfera (um nó comum ali derrubou o jogo no teste de 23/11)
+  if carsRoot.createBoundingSphereNode == nil then marca = false return end
+  local ok, n = pcall(carsRoot.createBoundingSphereNode, carsRoot, 'CJ_DETRITOS_SERVIDOR', 0.01)
+  if ok and n ~= nil then marca = n else marca = false end
 end
 
 local function limparTudo(porque)
@@ -147,7 +149,9 @@ local function procurar(dt)
   end
 end
 
+local espera = 3   -- s depois de carregar antes de mexer na cena dos carros
 function script.update(dt)
+  if espera > 0 then espera = espera - dt return end
   local sim = ac.getSim()
   if sim.currentSessionIndex ~= sessao then
     if sessao >= 0 then limparTudo('sessao nova') end
