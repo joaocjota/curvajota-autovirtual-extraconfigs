@@ -1230,6 +1230,11 @@ local function resumoMsg(reset)
   return msg, keep, s
 end
 
+local netN = 0
+local function netLog(...)
+  netN = netN + 1
+  if netN <= 40 then log('[rede]', ...) end
+end
 if online then
   local okE, err = pcall(function()
     sendHit = ac.OnlineEvent({
@@ -1238,6 +1243,7 @@ if online then
       ux = ac.StructItem.int8(), uy = ac.StructItem.int8(), uz = ac.StructItem.int8(),
       kmh = ac.StructItem.uint8(),
     }, function(sender, m)
+      netLog('recebi batida de', sender and sender.index or 'nil', m.kmh and (m.kmh .. ' km/h') or '')
       if sender == nil or sender.index == 0 then return end      -- a própria já foi aplicada
       addHit(sender.index, makeHit({ m.px, m.py, m.pz }, { m.ux, m.uy, m.uz }, m.kmh), true)
     end)
@@ -1252,6 +1258,7 @@ if online then
       uz = ac.StructItem.array(ac.StructItem.int8(), MAX_RESUMO),
       kmh = ac.StructItem.array(ac.StructItem.uint8(), MAX_RESUMO),
     }, function(sender, m)
+      netLog('recebi resumo de', sender and sender.index or 'nil', m.n, 'batidas, reset', m.reset)
       if sender == nil or sender.index == 0 then return end
       local s = carState(sender.index)
       if s.skip then return end
@@ -1273,6 +1280,7 @@ local function flushNet(dt)
   if sendHit and #outbox > 0 and sendT >= SEND_GAP then
     local q = outbox[1].q
     local ok = sendHit({ px = q[1], py = q[2], pz = q[3], ux = q[4], uy = q[5], uz = q[6], kmh = q[7] })
+    netLog('enviei batida', q[7], 'km/h:', tostring(ok))
     if ok then table.remove(outbox, 1) sendT = 0 end
   end
   if sendResumo and resumoDirty and resumoT >= RESUMO_GAP and sendT >= SEND_GAP and #outbox == 0 then
@@ -1285,7 +1293,9 @@ local function flushNet(dt)
           q[1], q[2], q[3], q[4], q[5], q[6], q[7]
       end
     end
-    if sendResumo(msg, true) then resumoDirty, resumoT, sendT = false, 0, 0 end
+    local okR = sendResumo(msg, true)
+    netLog('enviei resumo', msg.n, 'batidas:', tostring(okR))
+    if okR then resumoDirty, resumoT, sendT = false, 0, 0 end
   end
 end
 
@@ -1382,7 +1392,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v3.1 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3.2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
