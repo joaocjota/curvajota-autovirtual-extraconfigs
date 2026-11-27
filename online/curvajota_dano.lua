@@ -11,11 +11,14 @@
 --   3) a cada mudança o carro manda também um RESUMO (as batidas mais fortes) que o servidor repete para quem entrar depois;
 --   4) voltar aos boxes, reiniciar ou teleportar devolve a forma original, em todos os PCs;
 --   5) faíscas na batida e fumaça quando o carro está muito batido (só efeito visual, de cada PC);
---   6) v2: peças soltam e caem (portas abrem e ficam penduradas, capô, para-choques e asa inclinam e caem), ver "peças".
+--   6) v2: peças soltam e caem (portas abrem e ficam penduradas, capô, para-choques e asa inclinam e caem), ver "peças";
+--   7) v3: a peça caída vira objeto com física (bate, rola, é empurrada); quem bate nela leva dano e amassado, e passar
+--      por cima pode dar FURO LENTO no pneu (perde aderência aos poucos; troca de pneus no box conserta).
 -- Offline (treino com IA) o script mede a batida de todos os carros direto, sem mensagens.
 --
--- Só visual: o collider e a física do AC não mudam (o dano mecânico continua sendo o do AC/servidor). Opcional: quebrar
--- a suspensão do próprio carro numa batida forte perto da roda, se o CSP deixar (physics.allowed(); vai no log).
+-- O amassado é visual (o collider do carro não muda). Física: peças caídas são corpos físicos, batida em peça soma dano
+-- do AC e pode furar pneu (só no carro com física em cada PC). Opcional: quebrar a suspensão do próprio carro numa batida
+-- forte perto da roda (cfg suspensao). Tudo que mexe na física exige physics.allowed() (vai no log).
 -- Carros com dano próprio (ex.: CJT-500 Adsumus, que tem p500_dano.lua) ficam de fora pelo nome da pasta (ajuste 'pular').
 -- Escrito do zero pela Curva Jota; o método de amassado é o do p500_dano.lua do Adsumus (aprovado v0.9.33).
 -- Ajustes na seção [SCRIPT_...] do servidor (valores abaixo são o padrão).
@@ -42,6 +45,14 @@ local cfg = ac.configValues({
   parachoqueSolta = 25, parachoqueCai = 60,
   asaSolta = 30, asaCai = 70,
   maxPecas = 30,            -- peças no chão ao mesmo tempo (as mais velhas somem)
+  fisicaPecas = 1,          -- v3: 1 = peça caída vira objeto com física (bate, é empurrada, dá dano e pode furar pneu)
+  pecaMinKmh = 12,          -- velocidade (relativa) mínima de quem bate na peça para levar dano
+  pecaDano = 0.35,          -- dano na lataria (km/h do AC) por km/h de batida na peça (×massa da peça / 8 kg)
+  furoChance = 0.30,        -- chance de furo lento quando a roda passa por cima de uma peça (×velocidade / 100 km/h)
+  furoKmh = 25,             -- velocidade mínima para furar
+  furoGrip = 0.45,          -- perda de aderência no fim do esvaziamento (0 = nada, 1 = sem aderência)
+  furoTmin = 30, furoTmax = 90,            -- segundos para esvaziar
+  depurar = 0,              -- 1 = mostra a caixa de colisão das peças
   log = 1,
 })
 
@@ -298,7 +309,8 @@ end
 -- cai igual em todos. A queda (trajetória) é calculada em cada PC. A peça caída fica no chão até o carro ser reparado.
 -- Regiões em fração do tamanho da carroceria (comprimento L, altura H, meia-largura W), medidas no BMW M4 GT3.
 
-local GONE_PIECES = {}     -- peças no chão (todas os carros), em ordem; as mais velhas somem acima de cfg.maxPecas
+local GONE_PIECES = {}
+local pieceBox, dropBody, followBody, trySolid   -- v3, definidas mais abaixo     -- peças no chão (todas os carros), em ordem; as mais velhas somem acima de cfg.maxPecas
 
 local function m4(t) return t and t:clone() end
 
@@ -587,7 +599,13 @@ local function cutRegion(s, car, P)
     local holder = makeHolder(s, (m.orig or m.ref):getParent(), 'CJ_DANO_' .. P.id, pl.W)
     if holder then
       local piece = newPieceMesh(P, holder, m, verts, inds)
-      if piece then pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone() }
+      local lmin, lmax = vec3(1e9, 1e9, 1e9), vec3(-1e9, -1e9, -1e9)
+      for _, v in ipairs(verts) do
+        local q = v.pos
+        if q.x < lmin.x then lmin.x = q.x end if q.y < lmin.y then lmin.y = q.y end if q.z < lmin.z then lmin.z = q.z end
+        if q.x > lmax.x then lmax.x = q.x end if q.y > lmax.y then lmax.y = q.y end if q.z > lmax.z then lmax.z = q.z end
+      end
+      if piece then pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone(), lmin = lmin, lmax = lmax }
       else pcall(holder.dispose, holder) end
     end
     -- lataria sem a região: cópia com todos os vértices e só os triângulos que ficam; a original some
@@ -640,6 +658,289 @@ local function groundY(pos)
   return nil
 end
 
+-- ------------------------------------------------------------------ v3: peças com física, dano e furo
+-- A peça caída vira um corpo físico (physics.RigidBody, caixa do tamanho dela) assim que sai de perto dos carros: bate no
+-- chão, rola, é empurrada por quem passa. Quem bate nela (o carro com física neste PC: online, o seu) leva dano na lataria
+-- do AC, um amassado (que vai para todos como uma batida comum) e, se a roda passar por cima, pode ter um FURO LENTO
+-- (o pneu perde aderência aos poucos em 30–90 s; a troca de pneus no box ou o reparo devolvem). Cada PC simula as peças
+-- dele: uma peça chutada pode parar em lugar um pouco diferente em cada PC.
+local MASSA = { porta_e = 16, porta_d = 16, capo = 9, parachoque_d = 7, parachoque_t = 7, asa = 6 }
+local SOLIDS = {}          -- peças com corpo físico: { s, P, F }
+local FURO = {}            -- índice do carro -> { [roda 0..3] = { t, T, g, motivo } , km = {...} }
+local pushHit = nil        -- definida mais abaixo (registra uma batida do próprio carro e manda pela rede)
+local RODA_NOME = { [0] = 'dianteiro esquerdo', 'dianteiro direito', 'traseiro esquerdo', 'traseiro direito' }
+
+local function fisicaOk()
+  return physics ~= nil and physics.allowed ~= nil and physics.allowed()
+end
+
+local function carHasPhysicsHere(i)
+  if i == 0 then return true end
+  local car = ac.getCar(i)
+  return car ~= nil and not ac.getSim().isOnlineRace and car.physicsAvailable
+end
+
+-- caixa da peça no espaço do carro no momento da queda (B0inv)
+function pieceBox(s, P, B0inv)
+  local mn, mx = vec3(1e9, 1e9, 1e9), vec3(-1e9, -1e9, -1e9)
+  local function add(q)
+    if q.x < mn.x then mn.x = q.x end if q.y < mn.y then mn.y = q.y end if q.z < mn.z then mn.z = q.z end
+    if q.x > mx.x then mx.x = q.x end if q.y > mx.y then mx.y = q.y end if q.z > mx.z then mx.z = q.z end
+  end
+  if P.kind == 'node' then
+    local ms = P.node:findMeshes('?')
+    for i = 1, ms:size() do
+      local ref = ms:at(i, true)
+      local Wm = meshWorld(ref)
+      if Wm then
+        local T = Wm:clone():mul(B0inv)
+        local ok, vb = pcall(ref.getVertices, ref)
+        if ok and vb ~= nil and #vb > 0 then
+          local n = #vb
+          local stp = math.max(1, math.floor(n / 3000))
+          for k = 1, n, stp do add(T:transformPoint(vb:get(k).pos)) end
+        else
+          local c, r = ref:boundingSphere(1)
+          if c then
+            local q = T:transformPoint(c)
+            add(q - vec3(r, r, r)) add(q + vec3(r, r, r))
+          end
+        end
+      end
+    end
+  else
+    for _, pc in ipairs(P.pieces or {}) do
+      if pc.lmin then
+        local T = pc.holder:getWorldTransformationRaw():clone():mul(B0inv)
+        for _, x in ipairs({ pc.lmin.x, pc.lmax.x }) do for _, y in ipairs({ pc.lmin.y, pc.lmax.y }) do
+          for _, z in ipairs({ pc.lmin.z, pc.lmax.z }) do add(T:transformPoint(vec3(x, y, z))) end
+        end end
+      end
+    end
+  end
+  if mn.x > mx.x then return nil end
+  -- peças finas (porta, capô): no mínimo 4 cm em cada eixo
+  for _, ax in ipairs({ 'x', 'y', 'z' }) do
+    if mx[ax] - mn[ax] < 0.04 then local c = (mx[ax] + mn[ax]) * 0.5 mn[ax], mx[ax] = c - 0.02, c + 0.02 end
+  end
+  return mn, mx
+end
+
+function dropBody(F)
+  if F and F.body then
+    pcall(F.body.dispose, F.body)
+    F.body = nil
+    for k = #SOLIDS, 1, -1 do if SOLIDS[k].F == F then table.remove(SOLIDS, k) end end
+  end
+end
+
+-- malhas seguem o corpo físico (parada: atualiza só de vez em quando)
+function followBody(F, dt)
+  local b = F.body
+  local moving = b:getSpeedKmh() > 0.2 or b:getAngularSpeed() > 0.05
+  F.idle = moving and 0 or (F.idle or 0) + dt
+  if F.idle > 0.5 then
+    F.idleT = (F.idleT or 0) + dt
+    if F.idleT < 0.5 then return end
+    F.idleT = 0
+  end
+  local T = b:getTransformation()
+  if T == nil then return end
+  for _, it in ipairs(F.items) do setWorld(it.holder, it.rel:clone():mul(T)) end
+end
+
+local function boxLowY(Fw, mn, mx)
+  local low = 1e9
+  for _, x in ipairs({ mn.x, mx.x }) do for _, y in ipairs({ mn.y, mx.y }) do for _, z in ipairs({ mn.z, mx.z }) do
+    local q = Fw:transformPoint(vec3(x, y, z))
+    if q.y < low then low = q.y end
+  end end end
+  return low
+end
+
+local function wheelBit(w) return math.floor(2 ^ (2 + w) + 0.5) end
+
+local function furoTry(i, w, chance, motivo)
+  if not fisicaOk() or not carHasPhysicsHere(i) then return end
+  local f = FURO[i]
+  if f == nil then f = { km = {} } FURO[i] = f end
+  if f[w] or chance <= 0 or math.random() > chance then return end
+  f[w] = { t = 0, T = cfg.furoTmin + math.random() * math.max(0, cfg.furoTmax - cfg.furoTmin), g = -1, motivo = motivo }
+  log(string.format('carro %d FURO no pneu %s (%s), esvazia em %.0f s', i, RODA_NOME[w], motivo, f[w].T))
+  if i == 0 then pcall(ac.setMessage, 'Pneu furado', 'Pneu ' .. RODA_NOME[w] .. ' perdendo ar (' .. motivo .. ')') end
+end
+
+local function furoClear(i, why)
+  local f = FURO[i]
+  if f == nil then return end
+  local any = false
+  for w = 0, 3 do
+    if f[w] then any = true f[w] = nil pcall(physics.setGripDecrease, i, wheelBit(w), 0) end
+  end
+  f.km = {}
+  if any then log('carro', i, 'furos consertados (' .. why .. ')') end
+end
+
+local function furoUpdate(i, car, dt)
+  local f = FURO[i]
+  if f == nil then return end
+  for w = 0, 3 do
+    local wh = car.wheels[w]
+    -- troca de pneus: a quilometragem virtual do pneu volta para trás
+    local km = wh and wh.tyreVirtualKM or 0
+    if f.km[w] ~= nil and km < f.km[w] - 0.01 and f[w] then
+      f[w] = nil
+      pcall(physics.setGripDecrease, i, wheelBit(w), 0)
+      log('carro', i, 'pneu', RODA_NOME[w], 'trocado: furo consertado')
+    end
+    f.km[w] = km
+    local fw = f[w]
+    if fw then
+      fw.t = math.min(fw.T, fw.t + dt)
+      local x = fw.t / fw.T
+      local g = cfg.furoGrip * x * x * (3 - 2 * x)     -- começa devagar, acelera, assenta no fim
+      if math.abs(g - fw.g) > 0.005 then
+        fw.g = g
+        pcall(physics.setGripDecrease, i, wheelBit(w), g)
+      end
+    end
+  end
+end
+
+-- quem bateu na peça (só o carro com física neste PC): dano na lataria, amassado e talvez furo
+local function pieceHit(ci, s, P, F)
+  if ci == nil or not carHasPhysicsHere(ci) or F.body == nil then return end
+  local now = os.clock()
+  F.lastHit = F.lastHit or {}
+  if F.lastHit[ci] and now - F.lastHit[ci] < 0.4 then return end
+  F.lastHit[ci] = now
+  local car = ac.getCar(ci)
+  if car == nil then return end
+  local kmh = #(car.velocity - F.body:getVelocity()) * 3.6
+  if kmh < cfg.pecaMinKmh then return end
+  local hp = F.body:getLastHitPos()
+  if hp == nil or #hp < 1e-3 then hp = F.body:getTransformation():transformPoint((F.bmin + F.bmax) * 0.5) end
+  local lc = car.worldToLocal:transformPoint(hp)
+  local half = car.aabbSize and car.aabbSize * 0.5 or vec3(1, 0.7, 2.2)
+  local massK = clamp((F.kg or 8) / 8, 0.4, 1.5)
+  -- 1) dano do AC (zonas: 0 frente, 1 trás, 2 esquerda, 3 direita; X do carro aponta para a esquerda)
+  if fisicaOk() then
+    local zone
+    if math.abs(lc.z) / half.z > 0.55 then zone = lc.z > 0 and 0 or 1 else zone = lc.x > 0 and 2 or 3 end
+    local add = kmh * cfg.pecaDano * massK
+    local d = car.damage
+    local v = { d[0] or 0, d[1] or 0, d[2] or 0, d[3] or 0 }
+    v[zone + 1] = v[zone + 1] + add
+    pcall(physics.setCarBodyDamage, ci, vec4(v[1], v[2], v[3], v[4]))
+    log(string.format('carro %d bateu na peca %s a %.0f km/h: dano +%.0f na zona %d', ci, P.id, kmh, add, zone))
+  end
+  -- 2) amassado no ponto (todo mundo vê)
+  local dentKmh = kmh * 0.6 * massK
+  if pushHit and dentKmh >= cfg.minKmh then
+    local inward = vec3(-lc.x, (0.6 - lc.y) * 0.3, -lc.z)
+    if #inward < 1e-3 then inward = vec3(0, 0, -1) end
+    pushHit(ci, lc, inward:normalize(), dentKmh)
+  end
+  -- 3) furo: contato baixo, perto de uma roda
+  if kmh >= cfg.furoKmh and lc.y < 0.55 then
+    local best, bd = nil, 0.9
+    for w = 0, 3 do
+      local wh = car.wheels[w]
+      if wh then
+        local q = car.worldToLocal:transformPoint(wh.position)
+        local dd = math.sqrt((q.x - lc.x) ^ 2 + (q.z - lc.z) ^ 2)
+        if dd < bd then best, bd = w, dd end
+      end
+    end
+    if best then furoTry(ci, best, cfg.furoChance * clamp(kmh / 100, 0.5, 1.5), 'bateu na peca ' .. P.id) end
+  end
+end
+
+-- roda passando por cima de uma peça (o pneu do AC não "bate" no corpo físico; olha o ponto de contato)
+local function furoOver(i, car)
+  if #SOLIDS == 0 or car.speedKmh < cfg.furoKmh then return end
+  for _, e in ipairs(SOLIDS) do
+    local F = e.F
+    local b = F.body
+    if b and F.bmin then
+      local T = b:getTransformation()
+      local c = T:transformPoint((F.bmin + F.bmax) * 0.5)
+      if (c - car.position):length() < 6 then
+        local inv = T:inverse()
+        F.over = F.over or {}
+        for w = 0, 3 do
+          local wh = car.wheels[w]
+          if wh then
+            local q = inv:transformPoint(wh.contactPoint)
+            local inside = q.x > F.bmin.x - 0.08 and q.x < F.bmax.x + 0.08 and q.z > F.bmin.z - 0.08 and q.z < F.bmax.z + 0.08
+              and q.y > F.bmin.y - 0.25 and q.y < F.bmax.y + 0.25
+            local key = i * 4 + w
+            if inside and not F.over[key] then
+              F.over[key] = true
+              log(string.format('carro %d roda %s passou por cima da peca %s a %.0f km/h', i, RODA_NOME[w], e.P.id, car.speedKmh))
+              furoTry(i, w, cfg.furoChance * clamp(car.speedKmh / 100, 0.5, 1.5), 'passou por cima de ' .. e.P.id)
+            elseif not inside then
+              F.over[key] = nil
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+-- tenta virar corpo físico: só longe de todos os carros (senão o corpo nasceria dentro de um carro e daria um tranco)
+function trySolid(s, P, F)
+  if F.body or F.hidden then return end
+  if not fisicaOk() then
+    F.noPhys = true
+    log('sem permissao de fisica: pecas ficam so visuais')
+    return
+  end
+  local Fw = F.B0:clone():mul(F.M)
+  local center = (F.bmin + F.bmax) * 0.5
+  local size = F.bmax - F.bmin
+  local cw = Fw:transformPoint(center)
+  local reach = 0.25 + 0.5 * math.max(size.x, size.y, size.z)
+  local sim = ac.getSim()
+  for i = 0, sim.carsCount - 1 do
+    local car = ac.getCar(i)
+    if car and car.isConnected then
+      local hs = car.aabbSize and car.aabbSize * 0.5 or vec3(1, 0.7, 2.3)
+      local d = car.worldToLocal:transformPoint(cw) - (car.aabbCenter or vec3())
+      if math.abs(d.x) < hs.x + reach and math.abs(d.z) < hs.z + reach and math.abs(d.y) < hs.y + reach then
+        F.waitT = (F.waitT or 0) + 0.1
+        return
+      end
+    end
+  end
+  -- não nasce enterrado: sobe até o canto mais baixo ficar 1 cm acima do chão
+  local g = groundY(cw)
+  if g then
+    local low = boxLowY(Fw, F.bmin, F.bmax)
+    if low < g + 0.01 then Fw = Fw:clone():mul(mat4x4.translation(vec3(0, g + 0.01 - low, 0))) end
+  end
+  F.kg = (MASSA[P.id] or 8) * 1
+  local okB, body = pcall(physics.RigidBody, { physics.Collider.Box(size, center, nil, nil, cfg.depurar == 1) }, F.kg, center)
+  if not okB or body == nil then
+    F.noPhys = true
+    log('carro', s.index, P.id, 'corpo fisico falhou:', tostring(body):sub(1, 200))
+    return
+  end
+  pcall(body.setDamping, body, 0.1, 0.1, true)
+  body:setTransformation(Fw)
+  if F.landed then body:setVelocity(vec3(F.vel.x * 0.6, 0, F.vel.z * 0.6))
+  else
+    body:setVelocity(F.vel)
+    pcall(body.setAngularVelocity, body, F.axis * F.spin)
+  end
+  body:onCollision(function(ci) safe('peca bateu', pieceHit, ci, s, P, F) end)
+  F.body = body
+  SOLIDS[#SOLIDS + 1] = { s = s, P = P, F = F }
+  log(string.format('carro %d %s virou peca solida (%.0f kg, %s, esperou %.1f s)', s.index, P.id, F.kg,
+    F.landed and 'no chao' or 'no ar', F.waitT or 0))
+end
+
 local function startFall(s, car, P, fresh)
   local B = car.bodyTransform
   local items = {}
@@ -659,13 +960,24 @@ local function startFall(s, car, P, fresh)
       items[#items + 1] = { holder = pc.holder, W0 = Wn }
     end
   end
+  -- v3: quadro da peça = a 1ª malha/nó dela no momento da queda (B0; porta aberta = quadro da porta, caixa justa); cada
+  -- malha guarda a posição relativa a ele (rel) e a caixa de colisão sai das malhas nesse quadro (bmin/bmax). Depois o
+  -- corpo físico move o quadro e as malhas vão junto.
+  if #items == 0 then return end
+  local B0 = items[1].W0:clone()
+  local B0inv = B0:inverse()
+  for _, it in ipairs(items) do it.rel = it.W0:clone():mul(B0inv) end
+  local okBox, bmin, bmax = pcall(pieceBox, s, P, B0inv)
+  if not okBox then log('carro', s.index, P.id, 'caixa falhou:', tostring(bmin):sub(1, 200)) bmin, bmax = nil, nil end
   local c0 = B:transformPoint(P.c)
   local away = B:transformVector(vec3(P.c.x, 0, P.c.z)):normalize()
   local seed = rng(s.index * 131 + #s.hits * 977 + (#P.id) * 7)
   local F = { items = items, c0 = c0, pos = c0:clone(), ang = 0,
     vel = car.velocity * 0.55 + vec3(0, 1.8, 0) + away * 1.5,
     axis = B:transformVector(vec3(1, 0, 0)):normalize(), spin = (seed() - 0.5) * 9,
-    ground = groundY(c0) or (car.position.y), landed = false, rest = math.min(0.25, P.r * 0.25) }
+    ground = groundY(c0) or (car.position.y), landed = false, rest = math.min(0.25, P.r * 0.25),
+    B0 = B0, bmin = bmin, bmax = bmax, chk = 0 }
+  if bmin then log(string.format('carro %d %s caixa %.2f x %.2f x %.2f m', s.index, P.id, bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z)) end
   if not fresh then              -- veio do resumo (quem entrou depois): a peça já estava no chão longe daqui
     for _, it in ipairs(items) do pcall(it.holder.setVisible, it.holder, false) end
     F.hidden = true
@@ -677,6 +989,7 @@ local function startFall(s, car, P, fresh)
     if old.P.fall then
       for _, it in ipairs(old.P.fall.items) do pcall(it.holder.setVisible, it.holder, false) end
       old.P.fall.hidden = true
+      dropBody(old.P.fall)
     end
   end
   log('carro', s.index, P.id, 'caiu')
@@ -685,21 +998,41 @@ end
 local function fallUpdate(s, P, dt)
   local F = P.fall
   if F == nil or F.hidden then return end
+  if F.body then followBody(F, dt) return end
+  local M
   if not F.landed then
     F.vel = F.vel + vec3(0, -9.81 * dt, 0)
     local k = math.exp(-0.8 * dt)
     F.vel = vec3(F.vel.x * k, F.vel.y, F.vel.z * k)
     F.pos = F.pos + F.vel * dt
     F.ang = F.ang + F.spin * dt
-    if F.pos.y <= F.ground + F.rest and F.vel.y < 0 then
+    if F.bmin then
+      -- com caixa: pousa quando o canto mais baixo da peça toca o chão (não enterra)
+      M = mat4x4.translation(-F.c0):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
+      local low = boxLowY(F.B0:clone():mul(M), F.bmin, F.bmax)
+      if low <= F.ground + 0.01 and F.vel.y < 0 then
+        F.pos = vec3(F.pos.x, F.pos.y + (F.ground + 0.01 - low), F.pos.z)
+        F.landed = true
+        M = nil
+      end
+    elseif F.pos.y <= F.ground + F.rest and F.vel.y < 0 then
       F.ang = math.floor(F.ang / math.pi + 0.5) * math.pi
       F.pos = vec3(F.pos.x, F.ground + F.rest, F.pos.z)
       F.landed = true
     end
   end
+  M = M or mat4x4.translation(-F.c0):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
+  F.M = M
   for _, it in ipairs(F.items) do
-    local W = it.W0:clone():mul(mat4x4.translation(-F.c0)):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
-    setWorld(it.holder, W)
+    setWorld(it.holder, it.W0:clone():mul(M))
+  end
+  -- v3: assim que a peça sai de perto de todos os carros (no ar ou no chão), vira corpo físico
+  if cfg.fisicaPecas == 1 and F.bmin and not F.noPhys then
+    F.chk = F.chk + dt
+    if F.chk >= 0.1 then
+      F.chk = 0
+      safe('fisica ' .. P.id, trySolid, s, P, F)
+    end
   end
 end
 
@@ -750,6 +1083,7 @@ end
 local function partsRestore(s)
   if s.parts == nil then return end
   for _, P in ipairs(s.parts) do
+    if P.fall then dropBody(P.fall) end
     if P.kind == 'node' then
       if P.oldParent then pcall(P.node.setParent, P.node, P.oldParent) end
       if P.L0 then pcall(function() P.node:getTransformationRaw():set(P.L0) end) end
@@ -955,6 +1289,11 @@ local function localHit(i, s, car, acc)
   if u.z < -0.6 and c.z < half * 0.8 and c.z > -half * 0.3 then c = vec3(clamp(c.x, -0.8, 0.8), c.y, half * 0.88)
   elseif u.z > 0.6 and c.z > -half * 0.8 and c.z < half * 0.3 then c = vec3(clamp(c.x, -0.8, 0.8), c.y, -half * 0.88) end
   if kmh < cfg.minKmh then return end
+  pushHit(i, c, u, kmh)
+end
+
+-- registra uma batida do carro com física neste PC (aplica aqui, manda para os outros); também usada pela batida em peça
+pushHit = function(i, c, u, kmh)
   local hit = quantize(c, u, kmh)
   addHit(i, hit, true)
   if i == 0 then
@@ -1004,6 +1343,7 @@ local function checkReset(i, s, car, dt)
     if jump > 6 + #car.velocity * math.max(dt, 0.02) * 3 then why = why or string.format('teleporte %.0f m', jump) end
   end
   s.lastPos = pos:clone()
+  if why and FURO[i] and s.resetCounter ~= nil then furoClear(i, why) end
   if why and #s.hits > 0 then
     restore(s, why)
     if ACC[i] then ACC[i].lastVel = nil ACC[i].on = false ACC[i].w = 0 end
@@ -1012,7 +1352,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v2.2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
@@ -1024,6 +1364,7 @@ local function update(dt)
   if sim.currentSessionIndex ~= sessao then
     sessao = sim.currentSessionIndex
     for _, s in pairs(C) do restore(s, 'sessao nova') end
+    for i in pairs(FURO) do furoClear(i, 'sessao nova') end
   end
   for i = 0, sim.carsCount - 1 do
     local car = ac.getCar(i)
@@ -1032,7 +1373,11 @@ local function update(dt)
       if not s.skip then
         checkReset(i, s, car, dt)
         local mine = (i == 0) or (not online and car.physicsAvailable)
-        if mine then measure(i, s, car, dt) end
+        if mine then
+          measure(i, s, car, dt)
+          safe('furo', furoOver, i, car)
+          safe('furo', furoUpdate, i, car, dt)
+        end
         applyPending(s, car)
         partsUpdate(s, car, dt)
         if (#s.hits > 0) and car.distanceToCamera < 200 then pcall(ac.forceDetailedCarLOD, i) end

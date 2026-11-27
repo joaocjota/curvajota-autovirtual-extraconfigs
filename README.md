@@ -10,7 +10,7 @@ SCRIPT = 'https://raw.githubusercontent.com/joaocjota/curvajota-autovirtual-extr
 REQUIRED = 1
 ```
 
-- `online/curvajota_dano.lua`: dano online. Os carros amassam onde batem e todo mundo no servidor vê o mesmo amassado (a batida é medida pelo PC de quem bateu e vai para os outros numa mensagem curta; quem entra depois recebe um resumo). Voltar aos boxes, reiniciar ou teleportar repara. Faíscas na batida e fumaça quando o carro está muito batido. Só visual; carros com dano próprio (pasta com `cj_kwid_p500`) ficam de fora. Ligado com uma segunda seção:
+- `online/curvajota_dano.lua`: dano online. Os carros amassam onde batem e todo mundo no servidor vê o mesmo amassado (a batida é medida pelo PC de quem bateu e vai para os outros numa mensagem curta; quem entra depois recebe um resumo). Voltar aos boxes, reiniciar ou teleportar repara. Faíscas na batida e fumaça quando o carro está muito batido. Peças (portas, capô, para-choques, asa) soltam, caem e viram objetos com física: quem bate nelas leva dano e amassado, e passar por cima pode dar furo lento (troca de pneus conserta). Carros com dano próprio (pasta com `cj_kwid_p500`) ficam de fora. Ligado com uma segunda seção:
 
 ```ini
 [SCRIPT_CURVAJOTA_DANO]
