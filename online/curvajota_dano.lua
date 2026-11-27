@@ -751,13 +751,8 @@ function followBody(F, dt)
         D.t, cy, D.y0, D.g or -999, b:getSpeedKmh(), tostring(inW), tostring(en)))
     end
   end
-  local moving = b:getSpeedKmh() > 0.2 or b:getAngularSpeed() > 0.05
-  F.idle = moving and 0 or (F.idle or 0) + dt
-  if F.idle > 0.5 then
-    F.idleT = (F.idleT or 0) + dt
-    if F.idleT < 0.5 then return end
-    F.idleT = 0
-  end
+  -- v3.5: atualiza TODO quadro, mesmo com a peça parada. O suporte é filho de um nó do carro: se ficar um quadro sem
+  -- compensar, a peça anda junto com o carro (v3.4 pulava 0,5 s com a peça parada e ela "arrastava" atrás do carro).
   local T = b:getTransformation()
   if T == nil then return end
   for _, it in ipairs(F.items) do setWorld(it.holder, it.rel:clone():mul(T)) end
@@ -1425,7 +1420,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v3.4 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3.5 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
