@@ -737,6 +737,19 @@ end
 -- malhas seguem o corpo físico (parada: atualiza só de vez em quando)
 function followBody(F, dt)
   local b = F.body
+  local D = F.diag
+  if D and D.n < 4 then
+    D.t = D.t + dt
+    if D.t >= ({ 0.3, 1, 3, 8 })[D.n + 1] then
+      D.n = D.n + 1
+      local T = b:getTransformation()
+      local cy = T and T.position.y or -999
+      local inW, en = true, true
+      pcall(function() inW, en = b:isInWorld(), b:isEnabled() end)
+      log(string.format('peca solida %.1f s: centro y %.2f (comecou %.2f, chao %.2f), %.1f km/h, no mundo %s, ativo %s',
+        D.t, cy, D.y0, D.g or -999, b:getSpeedKmh(), tostring(inW), tostring(en)))
+    end
+  end
   local moving = b:getSpeedKmh() > 0.2 or b:getAngularSpeed() > 0.05
   F.idle = moving and 0 or (F.idle or 0) + dt
   if F.idle > 0.5 then
@@ -921,7 +934,7 @@ function trySolid(s, P, F)
     if low < g + 0.01 then Fw = Fw:clone():mul(mat4x4.translation(vec3(0, g + 0.01 - low, 0))) end
   end
   F.kg = (MASSA[P.id] or 8) * 1
-  local okB, body = pcall(physics.RigidBody, { physics.Collider.Box(size, center, nil, nil, cfg.depurar == 1) }, F.kg, center)
+  local okB, body = pcall(physics.RigidBody, { physics.Collider.Box(size, center, nil, nil, cfg.depurar == 1) }, F.kg)
   if not okB or body == nil then
     F.noPhys = true
     log('carro', s.index, P.id, 'corpo fisico falhou:', tostring(body):sub(1, 200))
@@ -936,6 +949,7 @@ function trySolid(s, P, F)
   end
   body:onCollision(function(ci) safe('peca bateu', pieceHit, ci, s, P, F) end)
   F.body = body
+  F.diag = { t = 0, y0 = Fw.position.y, g = g, n = 0 }
   SOLIDS[#SOLIDS + 1] = { s = s, P = P, F = F }
   log(string.format('carro %d %s virou peca solida (%.0f kg, %s, esperou %.1f s)', s.index, P.id, F.kg,
     F.landed and 'no chao' or 'no ar', F.waitT or 0))
@@ -964,11 +978,27 @@ local function startFall(s, car, P, fresh)
   -- malha guarda a posição relativa a ele (rel) e a caixa de colisão sai das malhas nesse quadro (bmin/bmax). Depois o
   -- corpo físico move o quadro e as malhas vão junto.
   if #items == 0 then return end
-  local B0 = items[1].W0:clone()
+  -- v3.1: quadro SEMPRE ortonormal (só rotação + posição; malhas do kn5 podem ter escala ou espelho, e o corpo físico
+  -- não aceita isso): eixos da 1ª malha normalizados se tiverem a mesma "mão" do carro, senão os eixos do carro.
+  local B0 = B:clone()
+  pcall(function()
+    local W = items[1].W0
+    local lk, up = W.look:clone():normalize(), W.up:clone():normalize()
+    local cand = mat4x4.look(W.position:clone(), lk, up)
+    local hand = function(M) return M.side:dot(M.up:cross(M.look)) end
+    if math.abs(lk:dot(up)) < 0.05 and hand(cand) * hand(B) > 0 then B0 = cand else B0.position = W.position:clone() end
+  end)
   local B0inv = B0:inverse()
-  for _, it in ipairs(items) do it.rel = it.W0:clone():mul(B0inv) end
   local okBox, bmin, bmax = pcall(pieceBox, s, P, B0inv)
   if not okBox then log('carro', s.index, P.id, 'caixa falhou:', tostring(bmin):sub(1, 200)) bmin, bmax = nil, nil end
+  if bmin then
+    -- origem do quadro no centro da caixa: o corpo gira em volta do próprio centro (sem cog separado)
+    local ctr = (bmin + bmax) * 0.5
+    B0 = mat4x4.translation(ctr):mul(B0)
+    bmin, bmax = bmin - ctr, bmax - ctr
+    B0inv = B0:inverse()
+  end
+  for _, it in ipairs(items) do it.rel = it.W0:clone():mul(B0inv) end
   local c0 = B:transformPoint(P.c)
   local away = B:transformVector(vec3(P.c.x, 0, P.c.z)):normalize()
   local seed = rng(s.index * 131 + #s.hits * 977 + (#P.id) * 7)
@@ -1352,7 +1382,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v3 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3.1 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
