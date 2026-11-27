@@ -447,13 +447,32 @@ local function setupParts(s, car)
     table.concat(ids, ' '), E.zR, E.zF, E.yT, E.W))
 end
 
--- nó suporte da peça, filho do carRoot (anda junto com o carro até cair)
-local function carRootW(s) return s.root:getWorldTransformationRaw() end
+-- nó suporte da peça: filho do MESMO nó pai da peça no modelo (v2.1 punha no carRoot e a peça sumia na tela);
+-- anda junto com o carro até cair, depois a posição no mundo é compensada a cada quadro
+local holderParents = setmetatable({}, { __mode = 'k' })
+local diagHolder = 0
 
-local function makeHolder(s, name, worldW)
-  local ok, h = pcall(s.root.createNode, s.root, name, false)
+local function setWorld(h, W)
+  local par = holderParents[h]
+  local pw = par and par:getWorldTransformationRaw()
+  if pw == nil then return end
+  h:getTransformationRaw():set(W:clone():mul(pw:inverse()))
+  if diagHolder < 4 then
+    diagHolder = diagHolder + 1
+    local got = h:getWorldTransformationRaw()
+    if got then
+      local e = (got:transformPoint(vec3()) - W:transformPoint(vec3())):length()
+      log(string.format('suporte: erro de posicao %.3f m', e))
+    end
+  end
+end
+
+local function makeHolder(s, parent, name, worldW)
+  parent = parent or s.root
+  local ok, h = pcall(parent.createNode, parent, name, false)
   if not ok or h == nil then log('carro', s.index, 'createNode falhou:', tostring(h):sub(1, 200)) return nil end
-  h:getTransformationRaw():set(worldW:clone():mul(carRootW(s):inverse()))
+  holderParents[h] = parent
+  setWorld(h, worldW)
   return h
 end
 
@@ -565,7 +584,7 @@ local function cutRegion(s, car, P)
       end
       inds[#inds + 1] = map[vi]
     end
-    local holder = makeHolder(s, 'CJ_DANO_' .. P.id, pl.W)
+    local holder = makeHolder(s, (m.orig or m.ref):getParent(), 'CJ_DANO_' .. P.id, pl.W)
     if holder then
       local piece = newPieceMesh(P, holder, m, verts, inds)
       if piece then pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone() }
@@ -594,10 +613,9 @@ end
 local function tiltPieces(s, car, P, a)
   -- rel0 = posição da malha em relação ao carro no recorte; gira na dobradiça (espaço do carro) e volta para o mundo
   local B = car.bodyTransform
-  local inv = carRootW(s):inverse()
   for _, pc in ipairs(P.pieces or {}) do
     local W = pc.rel0:clone():mul(mat4x4.translation(-P.hinge)):mul(mat4x4.rotation(a, P.axis)):mul(mat4x4.translation(P.hinge))
-    pc.holder:getTransformationRaw():set(W:mul(B):mul(inv))
+    setWorld(pc.holder, W:mul(B))
   end
 end
 
@@ -627,7 +645,7 @@ local function startFall(s, car, P, fresh)
   local items = {}
   if P.kind == 'node' then
     local W0 = P.node:getWorldTransformationRaw():clone()
-    local h = makeHolder(s, 'CJ_DANO_' .. P.id, W0)
+    local h = makeHolder(s, P.node:getParent(), 'CJ_DANO_' .. P.id, W0)
     if h == nil then return end
     P.oldParent = P.node:getParent()
     -- o nó vai para o suporte mantendo a própria posição relativa: suporte começa onde o nó estava
@@ -679,10 +697,9 @@ local function fallUpdate(s, P, dt)
       F.landed = true
     end
   end
-  local inv = carRootW(s):inverse()
   for _, it in ipairs(F.items) do
     local W = it.W0:clone():mul(mat4x4.translation(-F.c0)):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
-    it.holder:getTransformationRaw():set(W:mul(inv))
+    setWorld(it.holder, W)
   end
 end
 
@@ -995,7 +1012,11 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v2.1 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v2.2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+pcall(function()
+  local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
+  log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
+end)
 
 local function update(dt)
   sim = ac.getSim()
