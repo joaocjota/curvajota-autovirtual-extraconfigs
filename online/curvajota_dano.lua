@@ -10,7 +10,8 @@
 --      (o sorteio das dobras sai da própria batida, então é igual em todo PC);
 --   3) a cada mudança o carro manda também um RESUMO (as batidas mais fortes) que o servidor repete para quem entrar depois;
 --   4) voltar aos boxes, reiniciar ou teleportar devolve a forma original, em todos os PCs;
---   5) faíscas na batida e fumaça quando o carro está muito batido (só efeito visual, de cada PC).
+--   5) faíscas na batida e fumaça quando o carro está muito batido (só efeito visual, de cada PC);
+--   6) v2: peças soltam e caem (portas abrem e ficam penduradas, capô, para-choques e asa inclinam e caem), ver "peças".
 -- Offline (treino com IA) o script mede a batida de todos os carros direto, sem mensagens.
 --
 -- Só visual: o collider e a física do AC não mudam (o dano mecânico continua sendo o do AC/servidor). Opcional: quebrar
@@ -35,6 +36,12 @@ local cfg = ac.configValues({
   fumacaKmh = 140,          -- soma das batidas (km/h) a partir da qual o carro solta fumaça
   suspensao = 0,            -- 1 = batida forte perto da roda quebra a suspensão do próprio carro (se o CSP deixar)
   suspensaoKmh = 50,
+  pecas = 1,                -- 1 = peças soltam e caem (portas, capô, para-choques, asa)
+  portaSolta = 35, portaCai = 95,          -- dano somado perto da peça (km/h) para soltar e para cair
+  capoSolta = 45, capoCai = 110,
+  parachoqueSolta = 30, parachoqueCai = 75,
+  asaSolta = 40, asaCai = 85,
+  maxPecas = 30,            -- peças no chão ao mesmo tempo (as mais velhas somem)
   log = 1,
 })
 
@@ -116,7 +123,8 @@ local function collectMeshes(s)
       for i = 1, l:size() do local key = meshKey(l, i) if key then fora[key] = true end end
     end
   end
-  local list = s.root:findMeshes('{ lod:A & renderable:yes }')
+  local list = s.root:findMeshes('{ renderable:yes & lod:A & driverPiece:no & insideInterior:no & insideSteeringWheel:no }')
+  if list:size() == 0 then list = s.root:findMeshes('{ lod:A & renderable:yes }') end
   if list:size() == 0 then list = s.root:findMeshes('?') end
   local seen = {}
   for i = 1, list:size() do
@@ -279,7 +287,426 @@ local function applyHit(s, car, hit)
     cModel.x, cModel.y, cModel.z, nMesh, nVert))
 end
 
+-- ------------------------------------------------------------------ peças que soltam (v2)
+-- Dois tipos de peça:
+--   * nó próprio no modelo (portas DOOR_L/DOOR_R, e capô/para-choque/asa quando o mod tem nó com esse nome): a porta abre e
+--     fica pendurada na dobradiça, depois cai; as outras inclinam e caem;
+--   * região da carroceria (quando o capô, os para-choques ou a asa estão colados na mesma malha da lataria, como no
+--     BMW M4 GT3): os triângulos da região viram uma malha separada (a peça) e a lataria é trocada por uma cópia sem eles
+--     (fica o buraco). Primeiro a peça fica solta/inclinada, depois cai.
+-- O dano de cada peça é a soma das batidas perto dela; como todo PC recebe as mesmas batidas na mesma ordem, a peça solta e
+-- cai igual em todos. A queda (trajetória) é calculada em cada PC. A peça caída fica no chão até o carro ser reparado.
+-- Regiões em fração do tamanho da carroceria (comprimento L, altura H, meia-largura W), medidas no BMW M4 GT3.
+
+local GONE_PIECES = {}     -- peças no chão (todas os carros), em ordem; as mais velhas somem acima de cfg.maxPecas
+
+local function m4(t) return t and t:clone() end
+
+local function lowerName(list, i) return tostring(list:name(i) or ''):lower() end
+
+-- extensão da carroceria no espaço do carro, pela maior malha de fora
+local function bodyExtents(s, car)
+  local best = nil
+  for _, m in ipairs(s.meshes) do
+    if (best == nil or m.sr > best.sr) and not m.name:lower():find('glass', 1, true) then best = m end
+  end
+  if best == nil or not load(best) then return nil end
+  local T = meshWorld(best.ref):clone():mul(car.bodyTransform:inverse())
+  local E = { zF = -99, zR = 99, yT = -99, W = 0 }
+  local p0, d = best.p0, best.d
+  for i = 0, best.n - 1, 3 do      -- 1 em cada 3 vértices basta para os limites
+    local j = 3 * i
+    local q = T:transformPoint(vec3(p0[j] + d[j], p0[j + 1] + d[j + 1], p0[j + 2] + d[j + 2]))
+    if q.z > E.zF then E.zF = q.z end
+    if q.z < E.zR then E.zR = q.z end
+    if q.y > E.yT then E.yT = q.y end
+    if math.abs(q.x) > E.W then E.W = math.abs(q.x) end
+  end
+  E.L = E.zF - E.zR
+  return E
+end
+
+-- sentido do giro: o ponto tv (a partir da dobradiça) tem de ir para o lado que want() aceita
+local function signFor(axis, tv, want)
+  local r = mat4x4.rotation(0.5, axis):transformVector(tv)
+  return want(r) and 1 or -1
+end
+
+-- regiões: fn(p, n) no espaço do carro; centro e raio para somar o dano; dobradiça (ponto e eixo) para inclinar
+local function regionDefs(E)
+  local L, H, W, zF, zR = E.L, E.yT, E.W, E.zF, E.zR
+  local defs = {
+    { id = 'capo', solta = cfg.capoSolta, cai = cfg.capoCai,
+      fn = function(p, n) return p.z > zF - 0.31 * L and p.z < zF - 0.05 * L and p.y > 0.49 * H and math.abs(p.x) < 0.73 * W and n.y > 0.35 end,
+      c = vec3(0, 0.6 * H, zF - 0.18 * L), r = 0.75, hinge = vec3(0, 0.62 * H, zF - 0.31 * L), axis = vec3(1, 0, 0), ang = 0.35,
+      tv = vec3(0, 0, 1), want = function(r) return r.y > 0 end },
+    { id = 'parachoque_d', solta = cfg.parachoqueSolta, cai = cfg.parachoqueCai,
+      fn = function(p) return p.z > zF - 0.10 * L and p.y < 0.50 * H end,
+      c = vec3(0, 0.3 * H, zF - 0.04 * L), r = 0.8, hinge = vec3(W * 0.9, 0.35 * H, zF - 0.05 * L), axis = vec3(0, 1, 0), ang = 0.25,
+      tv = vec3(-1, 0, 0), want = function(r) return r.z > 0 end },
+    { id = 'parachoque_t', solta = cfg.parachoqueSolta, cai = cfg.parachoqueCai,
+      fn = function(p) return p.z < zR + 0.09 * L and p.y < 0.68 * H end,
+      c = vec3(0, 0.4 * H, zR + 0.04 * L), r = 0.8, hinge = vec3(-W * 0.9, 0.45 * H, zR + 0.05 * L), axis = vec3(0, 1, 0), ang = 0.25,
+      tv = vec3(1, 0, 0), want = function(r) return r.z < 0 end },
+    { id = 'asa', solta = cfg.asaSolta, cai = cfg.asaCai,
+      fn = function(p) return p.z < zR + 0.15 * L and p.y > 0.755 * H end,
+      c = vec3(0, 0.88 * H, zR + 0.07 * L), r = 0.7, hinge = vec3(0, 0.80 * H, zR + 0.10 * L), axis = vec3(1, 0, 0), ang = 0.30,
+      tv = vec3(0, 0, -1), want = function(r) return r.y < 0 end,
+      check = function(minY, spanX) return minY > 0.70 * H and spanX > 1.0 * W end },
+  }
+  for _, R in ipairs(defs) do R.ang = R.ang * signFor(R.axis, R.tv, R.want) end
+  return defs
+end
+
+-- nós com nome conhecido. Portas: padrão do AC. Os outros por palavra no nome (o nó mais alto que casar).
+local NODE_WORDS = {
+  capo = { 'bonnet', 'hood', 'cofano', 'capot', 'motorhood' },
+  asa = { 'wing', 'spoiler', 'alettone', 'aileron' },
+  parachoque = { 'bumper', 'paraurti', 'parachoque' },
+}
+
+local function nodeCenter(s, car, node)
+  local ms = node:findMeshes('?')
+  local inv = car.bodyTransform:inverse()
+  local sum, n, rmax = vec3(), 0, 0.2
+  local cs = {}
+  for i = 1, ms:size() do
+    local ref = ms:at(i, true)
+    local c, r = ref:boundingSphere(1)
+    local w = meshWorld(ref)
+    if c and w then
+      local q = w:transformPoint(c)
+      q = inv:transformPoint(q)
+      cs[#cs + 1] = { q, r }
+      sum = sum + q
+      n = n + 1
+    end
+  end
+  if n == 0 then return nil end
+  local c = sum / n
+  for _, e in ipairs(cs) do rmax = math.max(rmax, (e[1] - c):length() + e[2]) end
+  return c, rmax
+end
+
+local function setupParts(s, car)
+  s.parts = {}
+  local E = bodyExtents(s, car)
+  if E == nil then log('carro', s.index, 'sem carroceria para pecas') return end
+  s.E = E
+  local haveNode = {}
+  -- portas
+  for _, nm in ipairs({ 'DOOR_L', 'DOOR_R', 'DOOR_FL', 'DOOR_FR', 'DOOR_LF', 'DOOR_RF' }) do
+    local nodes = s.root:findNodes(nm)
+    if nodes:size() > 0 then
+      local node = nodes:at(1)
+      local c, r = nodeCenter(s, car, node)
+      if c and r < 1.6 then
+        local side = c.x >= 0 and 1 or -1
+        s.parts[#s.parts + 1] = { id = 'porta_' .. (side > 0 and 'e' or 'd'), kind = 'node', node = node, c = c, r = math.min(r, 1.0),
+          solta = cfg.portaSolta, cai = cfg.portaCai, hinge = vec3(c.x, c.y, c.z + 0.8 * math.min(r, 1.0)), axis = vec3(0, 1, 0),
+          ang = 1.0 * signFor(vec3(0, 1, 0), vec3(0, 0, -1), function(r) return r.x * side > 0 end), dmg = 0, state = 0 }
+      end
+    end
+  end
+  -- outros nós por nome
+  local all = s.root:findNodes('?')
+  for i = 1, all:size() do
+    local nm = lowerName(all, i)
+    for kind, words in pairs(NODE_WORDS) do
+      for _, w in ipairs(words) do
+        if nm:find(w, 1, true) and not nm:find('glass', 1, true) and not nm:find('light', 1, true) then
+          local node = all:at(i)
+          local c, r = nodeCenter(s, car, node)
+          if c and r < 1.4 then
+            local id = kind
+            if kind == 'parachoque' then id = c.z > 0 and 'parachoque_d' or 'parachoque_t' end
+            if not haveNode[id] then
+              haveNode[id] = true
+              for _, R in ipairs(regionDefs(E)) do
+                if R.id == id then
+                  s.parts[#s.parts + 1] = { id = id, kind = 'node', node = node, c = c, r = r, solta = R.solta, cai = R.cai,
+                    hinge = R.hinge, axis = R.axis, ang = R.ang, dmg = 0, state = 0 }
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  for _, R in ipairs(regionDefs(E)) do
+    if not haveNode[R.id] then
+      s.parts[#s.parts + 1] = { id = R.id, kind = 'region', fn = R.fn, check = R.check, c = R.c, r = R.r, solta = R.solta,
+        cai = R.cai, hinge = R.hinge, axis = R.axis, ang = R.ang, dmg = 0, state = 0 }
+    end
+  end
+  local ids = {}
+  for _, P in ipairs(s.parts) do ids[#ids + 1] = P.id .. '(' .. P.kind .. ')' end
+  log(string.format('carro %d pecas: %s; carroceria z %.2f..%.2f, altura %.2f, meia-largura %.2f', s.index,
+    table.concat(ids, ' '), E.zR, E.zF, E.yT, E.W))
+end
+
+-- nó suporte da peça, filho do carRoot (anda junto com o carro até cair)
+local function carRootW(s) return s.root:getWorldTransformationRaw() end
+
+local function makeHolder(s, name, worldW)
+  local h = s.root:createNode(name, false)
+  if h == nil then return nil end
+  h:getTransformationRaw():set(worldW:clone():mul(carRootW(s):inverse()))
+  return h
+end
+
+-- recorta a região das malhas da carroceria: devolve lista de { mesh (nova, no suporte), holder, W0 }
+local function cutRegion(s, car, P)
+  local T0 = car.bodyTransform:inverse()
+  local pieces = {}
+  local minY, maxX, minX = 99, -99, 99
+  local plan = {}
+  for _, m in ipairs(s.meshes) do
+    if m.sr > 0.25 and load(m) then
+      local okI, ib = pcall(m.ref.getIndices, m.ref)
+      if okI and ib ~= nil and #ib >= 3 then
+        local W = meshWorld(m.ref)
+        local T = W:clone():mul(T0)
+        local inside = {}
+        local p0, d, n0 = m.p0, m.d, m.n0
+        for i = 0, m.n - 1 do
+          local j = 3 * i
+          local q = T:transformPoint(vec3(p0[j] + d[j], p0[j + 1] + d[j + 1], p0[j + 2] + d[j + 2]))
+          local nn = T:transformVector(vec3(n0[j], n0[j + 1], n0[j + 2]))
+          if P.fn(q, nn) then
+            inside[i] = true
+            if q.y < minY then minY = q.y end
+            if q.x > maxX then maxX = q.x end
+            if q.x < minX then minX = q.x end
+          end
+        end
+        local cutT, keepT = {}, {}
+        for t = 1, #ib, 3 do
+          local a, b, c = ib:get(t), ib:get(t + 1), ib:get(t + 2)
+          if inside[a] and inside[b] and inside[c] then cutT[#cutT + 1] = t else keepT[#keepT + 1] = t end
+        end
+        if #cutT >= 4 then plan[#plan + 1] = { m = m, ib = ib, cutT = cutT, keepT = keepT, W = W } end
+      end
+    end
+  end
+  if #plan == 0 then return nil end
+  if P.check and not P.check(minY, maxX - minX) then
+    log('carro', s.index, P.id, 'nao parece peca separada (ignorada)')
+    P.state = 3
+    return nil
+  end
+  for _, pl in ipairs(plan) do
+    local m, ib = pl.m, pl.ib
+    -- peça: vértices usados pelos triângulos recortados
+    local map, vb, nv = {}, ac.VertexBuffer(), 0
+    local idx = ac.IndicesBuffer()
+    local verts, inds = {}, {}
+    for _, t in ipairs(pl.cutT) do
+      for k = 0, 2 do
+        local vi = ib:get(t + k)
+        if map[vi] == nil then
+          nv = nv + 1
+          map[vi] = nv - 1
+          verts[nv] = m.vb:get(vi + 1)
+        end
+        inds[#inds + 1] = map[vi]
+      end
+    end
+    vb = ac.VertexBuffer(verts)
+    idx = ac.IndicesBuffer(inds)
+    local holder = makeHolder(s, 'CJ_DANO_' .. P.id, pl.W)
+    if holder then
+      local piece = holder:createMesh('CJ_DANO_' .. P.id .. '_' .. m.name, nil, vb, idx, false)
+      if piece then
+        pcall(piece.assignMaterialFrom, piece, m.ref)
+        pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone() }
+      else
+        holder:dispose()
+      end
+    end
+    -- lataria sem a região: cópia com os triângulos que ficam; a original some
+    local rest = {}
+    for _, t in ipairs(pl.keepT) do rest[#rest + 1] = ib:get(t) rest[#rest + 1] = ib:get(t + 1) rest[#rest + 1] = ib:get(t + 2) end
+    local parent = m.ref:getParent()
+    if parent and #rest > 0 then
+      local nm = parent:createMesh('CJ_DANO_RESTO_' .. m.name, nil, m.vb:clone(), ac.IndicesBuffer(rest), false)
+      if nm then
+        pcall(nm.assignMaterialFrom, nm, m.orig or m.ref)
+        m.orig = m.orig or m.ref
+        if m.ref ~= m.orig then pcall(m.ref.dispose, m.ref) end
+        m.orig:setVisible(false)
+        m.ref = nm
+        m.created = nm
+      end
+    end
+  end
+  log(string.format('carro %d recortou %s: %d malhas', s.index, P.id, #pieces))
+  return pieces
+end
+
+-- inclinação (peça solta): gira o suporte em volta da dobradiça (espaço do carro)
+local function tiltPieces(s, car, P, a)
+  -- rel0 = posição da malha em relação ao carro no recorte; gira na dobradiça (espaço do carro) e volta para o mundo
+  local B = car.bodyTransform
+  local inv = carRootW(s):inverse()
+  for _, pc in ipairs(P.pieces or {}) do
+    local W = pc.rel0:clone():mul(mat4x4.translation(-P.hinge)):mul(mat4x4.rotation(a, P.axis)):mul(mat4x4.translation(P.hinge))
+    pc.holder:getTransformationRaw():set(W:mul(B):mul(inv))
+  end
+end
+
+local function nodeTilt(s, P, a)
+  if P.L0 == nil then
+    P.L0 = P.node:getTransformationRaw():clone()
+  end
+  local par = P.node:getParent()
+  -- dobradiça e eixo no espaço do pai do nó (o pai anda junto com o carro)
+  local car = ac.getCar(s.index)
+  local inv = par and par:getWorldTransformationRaw() and par:getWorldTransformationRaw():inverse()
+  if inv == nil then return end
+  local h = inv:transformPoint(car.bodyTransform:transformPoint(P.hinge))
+  local ax = inv:transformVector(car.bodyTransform:transformVector(P.axis)):normalize()
+  local L = P.L0:clone():mul(mat4x4.translation(-h)):mul(mat4x4.rotation(a, ax)):mul(mat4x4.translation(h))
+  P.node:getTransformationRaw():set(L)
+end
+
+local function groundY(pos)
+  local ok, dist = pcall(physics.raycastTrack, pos + vec3(0, 2, 0), vec3(0, -1, 0), 8)
+  if ok and type(dist) == 'number' and dist >= 0 then return pos.y + 2 - dist end
+  return nil
+end
+
+local function startFall(s, car, P, fresh)
+  local B = car.bodyTransform
+  local items = {}
+  if P.kind == 'node' then
+    local W0 = P.node:getWorldTransformationRaw():clone()
+    local h = makeHolder(s, 'CJ_DANO_' .. P.id, W0)
+    if h == nil then return end
+    P.oldParent = P.node:getParent()
+    -- o nó vai para o suporte mantendo a própria posição relativa: suporte começa onde o nó estava
+    P.node:getTransformationRaw():set(mat4x4())
+    P.node:setParent(h)
+    items[1] = { holder = h, W0 = W0 }
+    P.holderNode = h
+  else
+    for _, pc in ipairs(P.pieces or {}) do
+      local Wn = pc.holder:getWorldTransformationRaw():clone()
+      items[#items + 1] = { holder = pc.holder, W0 = Wn }
+    end
+  end
+  local c0 = B:transformPoint(P.c)
+  local away = B:transformVector(vec3(P.c.x, 0, P.c.z)):normalize()
+  local seed = rng(s.index * 131 + #s.hits * 977 + (#P.id) * 7)
+  local F = { items = items, c0 = c0, pos = c0:clone(), ang = 0,
+    vel = car.velocity * 0.55 + vec3(0, 1.8, 0) + away * 1.5,
+    axis = B:transformVector(vec3(1, 0, 0)):normalize(), spin = (seed() - 0.5) * 9,
+    ground = groundY(c0) or (car.position.y), landed = false, rest = math.min(0.25, P.r * 0.25) }
+  if not fresh then              -- veio do resumo (quem entrou depois): a peça já estava no chão longe daqui
+    for _, it in ipairs(items) do pcall(it.holder.setVisible, it.holder, false) end
+    F.hidden = true
+  end
+  P.fall = F
+  GONE_PIECES[#GONE_PIECES + 1] = { s = s, P = P }
+  while #GONE_PIECES > cfg.maxPecas do
+    local old = table.remove(GONE_PIECES, 1)
+    if old.P.fall then
+      for _, it in ipairs(old.P.fall.items) do pcall(it.holder.setVisible, it.holder, false) end
+      old.P.fall.hidden = true
+    end
+  end
+  log('carro', s.index, P.id, 'caiu')
+end
+
+local function fallUpdate(s, P, dt)
+  local F = P.fall
+  if F == nil or F.hidden then return end
+  if not F.landed then
+    F.vel = F.vel + vec3(0, -9.81 * dt, 0)
+    local k = math.exp(-0.8 * dt)
+    F.vel = vec3(F.vel.x * k, F.vel.y, F.vel.z * k)
+    F.pos = F.pos + F.vel * dt
+    F.ang = F.ang + F.spin * dt
+    if F.pos.y <= F.ground + F.rest and F.vel.y < 0 then
+      F.ang = math.floor(F.ang / math.pi + 0.5) * math.pi
+      F.pos = vec3(F.pos.x, F.ground + F.rest, F.pos.z)
+      F.landed = true
+    end
+  end
+  local inv = carRootW(s):inverse()
+  for _, it in ipairs(F.items) do
+    local W = it.W0:clone():mul(mat4x4.translation(-F.c0)):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
+    it.holder:getTransformationRaw():set(W:mul(inv))
+  end
+end
+
+-- soma o dano de uma batida nas peças e muda o estado (0 inteira, 1 solta, 2 caiu, 3 não existe)
+local function partsHit(s, car, hit, fresh)
+  if cfg.pecas ~= 1 then return end
+  if s.parts == nil then setupParts(s, car) end
+  for _, P in ipairs(s.parts) do
+    if P.state < 2 then
+      local dist = (hit.p - P.c):length()
+      local f = 1 - dist / (P.r + 0.6)
+      if f > 0 then
+        P.dmg = P.dmg + hit.kmh * f
+        if P.state == 0 and P.dmg >= P.solta then
+          P.state = 1
+          if P.kind == 'region' then
+            P.pieces = cutRegion(s, car, P)
+            if P.pieces then
+              for _, pc in ipairs(P.pieces) do pc.rel0 = pc.W0:clone():mul(car.bodyTransform:inverse()) end
+            elseif P.state ~= 3 then P.state = 3 end
+          end
+          if P.state == 1 then log('carro', s.index, P.id, 'solta', string.format('%.0f', P.dmg)) end
+        end
+        if P.state == 1 then
+          local k = clamp((P.dmg - P.solta) / math.max(1, P.cai - P.solta), 0, 1)
+          P.tilt = P.ang * (0.35 + 0.65 * k)
+          if P.kind == 'node' then nodeTilt(s, P, P.tilt) else tiltPieces(s, car, P, P.tilt) end
+          if P.dmg >= P.cai then
+            P.state = 2
+            startFall(s, car, P, fresh)
+          end
+        end
+      end
+    end
+  end
+end
+
+local function partsUpdate(s, car, dt)
+  if s.parts == nil then return end
+  for _, P in ipairs(s.parts) do
+    if P.state == 1 and P.kind == 'region' and P.pieces then tiltPieces(s, car, P, P.tilt or 0) end
+    if P.state == 2 then safe('queda ' .. P.id, fallUpdate, s, P, dt) end
+  end
+end
+
+local function partsRestore(s)
+  if s.parts == nil then return end
+  for _, P in ipairs(s.parts) do
+    if P.kind == 'node' then
+      if P.oldParent then pcall(P.node.setParent, P.node, P.oldParent) end
+      if P.L0 then pcall(function() P.node:getTransformationRaw():set(P.L0) end) end
+      if P.holderNode then pcall(P.holderNode.dispose, P.holderNode) end
+    else
+      for _, pc in ipairs(P.pieces or {}) do pcall(pc.holder.dispose, pc.holder) end
+    end
+  end
+  for k = #GONE_PIECES, 1, -1 do if GONE_PIECES[k].s == s then table.remove(GONE_PIECES, k) end end
+  for _, m in ipairs(s.meshes or {}) do
+    if m.orig then
+      pcall(m.orig.setVisible, m.orig, true)
+      if m.created then pcall(m.created.dispose, m.created) end
+      m.ref, m.orig, m.created = m.orig, nil, nil
+    end
+  end
+  s.parts = nil
+end
+
 local function restore(s, why)
+  safe('reparo das pecas', partsRestore, s)
   if s.meshes ~= nil then
     for _, m in ipairs(s.meshes) do
       if m.vb then safe('reparo', function()
@@ -337,6 +764,7 @@ end
 local function addHit(i, hit, fresh)
   local s = carState(i)
   if s.skip then return end
+  hit.fresh = fresh
   s.hits[#s.hits + 1] = hit
   s.total = s.total + hit.kmh
   if hit.p.z > 0.3 then s.front = s.front + hit.kmh elseif hit.p.z < -0.3 then s.rear = s.rear + hit.kmh end
@@ -349,6 +777,7 @@ local function applyPending(s, car)
   for k = s.applied + 1, #s.hits do
     s.applied = k
     safe('batida', applyHit, s, car, s.hits[k])
+    safe('pecas', partsHit, s, car, s.hits[k], s.hits[k].fresh)
   end
 end
 
@@ -518,7 +947,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 
 local function update(dt)
   sim = ac.getSim()
@@ -536,6 +965,8 @@ local function update(dt)
         local mine = (i == 0) or (not online and car.physicsAvailable)
         if mine then measure(i, s, car, dt) end
         applyPending(s, car)
+        partsUpdate(s, car, dt)
+        if (#s.hits > 0) and car.distanceToCamera < 200 then pcall(ac.forceDetailedCarLOD, i) end
         if smoke and s.total >= cfg.fumacaKmh and car.distanceToCamera < 150 then
           s.smokeT = s.smokeT + dt
           if s.smokeT > 0.08 then
