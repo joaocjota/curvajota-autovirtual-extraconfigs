@@ -980,17 +980,36 @@ local function startFall(s, car, P, fresh)
   if #items == 0 then return end
   -- v3.1: quadro SEMPRE ortonormal (só rotação + posição; malhas do kn5 podem ter escala ou espelho, e o corpo físico
   -- não aceita isso): eixos da 1ª malha normalizados se tiverem a mesma "mão" do carro, senão os eixos do carro.
-  local B0 = B:clone()
+  local function frame(sd, u, l, p)
+    return mat4x4(vec4(sd.x, sd.y, sd.z, 0), vec4(u.x, u.y, u.z, 0), vec4(l.x, l.y, l.z, 0), vec4(p.x, p.y, p.z, 1))
+  end
+  local P0 = items[1].W0:transformPoint(vec3())
+  local carFrame = function() return frame(B.side:clone():normalize(), B.up:clone():normalize(), B.look:clone():normalize(), P0) end
+  local B0 = carFrame()
   pcall(function()
+    -- eixos da 1ª malha, ortonormalizados à mão (mat4x4.look deu matriz degenerada no jogo, v3.1)
     local W = items[1].W0
-    local lk, up = W.look:clone():normalize(), W.up:clone():normalize()
-    local cand = mat4x4.look(W.position:clone(), lk, up)
-    local hand = function(M) return M.side:dot(M.up:cross(M.look)) end
-    if math.abs(lk:dot(up)) < 0.05 and hand(cand) * hand(B) > 0 then B0 = cand else B0.position = W.position:clone() end
+    local l = W.look:clone():normalize()
+    local u = W.up:clone()
+    u = (u - l * u:dot(l)):normalize()
+    local sd = u:cross(l):normalize()
+    local hand = B.side:dot(B.up:cross(B.look))
+    if hand < 0 then sd = sd * -1 end
+    local M = frame(sd, u, l, P0)
+    -- confere: rotação pura (sem escala), mesma "mão" do carro, e leva a origem para P0
+    local ok = math.abs(#M.side - 1) < 0.01 and math.abs(#M.up - 1) < 0.01 and math.abs(#M.look - 1) < 0.01
+      and M.side:dot(M.up:cross(M.look)) * hand > 0 and (M:transformPoint(vec3()) - P0):length() < 0.01
+    if ok then B0 = M end
   end)
   local B0inv = B0:inverse()
   local okBox, bmin, bmax = pcall(pieceBox, s, P, B0inv)
   if not okBox then log('carro', s.index, P.id, 'caixa falhou:', tostring(bmin):sub(1, 200)) bmin, bmax = nil, nil end
+  if bmin and (bmax - bmin):length() > 8 then
+    log('carro', s.index, P.id, string.format('caixa absurda (%.1f m): usando os eixos do carro', (bmax - bmin):length()))
+    B0 = carFrame() B0inv = B0:inverse()
+    okBox, bmin, bmax = pcall(pieceBox, s, P, B0inv)
+    if not okBox or bmin == nil or (bmax - bmin):length() > 8 then bmin, bmax = nil, nil end
+  end
   if bmin then
     -- origem do quadro no centro da caixa: o corpo gira em volta do próprio centro (sem cog separado)
     local ctr = (bmin + bmax) * 0.5
@@ -1392,7 +1411,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v3.2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3.3 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
