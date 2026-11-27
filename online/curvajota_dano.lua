@@ -22,11 +22,11 @@
 
 local cfg = ac.configValues({
   minKmh = 7,               -- perda de velocidade mínima numa batida para amassar (km/h)
-  profundidade = 0.0024,    -- afundamento (m) por km/h acima do mínimo
-  maxAmassado = 0.12,       -- afundamento máximo de uma batida (m)
-  maxTotal = 0.18,          -- deslocamento máximo acumulado de um ponto (m)
+  profundidade = 0.0040,    -- afundamento (m) por km/h acima do mínimo
+  maxAmassado = 0.18,       -- afundamento máximo de uma batida (m)
+  maxTotal = 0.28,          -- deslocamento máximo acumulado de um ponto (m)
   raioMin = 0.22,           -- raio do amassado (m), cresce com a força até raioMax
-  raioMax = 0.55,
+  raioMax = 0.65,
   raioKmh = 80,
   ondulacao = 0.35,         -- dobras da lata (fração do afundamento)
   distancia = 300,          -- só lê/amassa malhas de carros até esta distância da câmera (o resto fica guardado)
@@ -37,10 +37,10 @@ local cfg = ac.configValues({
   suspensao = 0,            -- 1 = batida forte perto da roda quebra a suspensão do próprio carro (se o CSP deixar)
   suspensaoKmh = 50,
   pecas = 1,                -- 1 = peças soltam e caem (portas, capô, para-choques, asa)
-  portaSolta = 35, portaCai = 95,          -- dano somado perto da peça (km/h) para soltar e para cair
-  capoSolta = 45, capoCai = 110,
-  parachoqueSolta = 30, parachoqueCai = 75,
-  asaSolta = 40, asaCai = 85,
+  portaSolta = 25, portaCai = 70,          -- dano somado perto da peça (km/h) para soltar e para cair
+  capoSolta = 35, capoCai = 90,
+  parachoqueSolta = 25, parachoqueCai = 60,
+  asaSolta = 30, asaCai = 70,
   maxPecas = 30,            -- peças no chão ao mesmo tempo (as mais velhas somem)
   log = 1,
 })
@@ -422,6 +422,7 @@ local function setupParts(s, car)
             if kind == 'parachoque' then id = c.z > 0 and 'parachoque_d' or 'parachoque_t' end
             if not haveNode[id] then
               haveNode[id] = true
+              log('carro', s.index, 'no', tostring(all:name(i)), 'vira peca', id)
               for _, R in ipairs(regionDefs(E)) do
                 if R.id == id then
                   s.parts[#s.parts + 1] = { id = id, kind = 'node', node = node, c = c, r = r, solta = R.solta, cai = R.cai,
@@ -450,10 +451,58 @@ end
 local function carRootW(s) return s.root:getWorldTransformationRaw() end
 
 local function makeHolder(s, name, worldW)
-  local h = s.root:createNode(name, false)
-  if h == nil then return nil end
+  local ok, h = pcall(s.root.createNode, s.root, name, false)
+  if not ok or h == nil then log('carro', s.index, 'createNode falhou:', tostring(h):sub(1, 200)) return nil end
   h:getTransformationRaw():set(worldW:clone():mul(carRootW(s):inverse()))
   return h
+end
+
+local function bufSize(b) if b.size then return b:size() end return #b end
+local function bufGet(b, k)   -- k a partir de 0
+  if b.raw ~= nil then return b.raw[k] end
+  return b:get(k + 1)
+end
+
+-- cada passo com nome: um erro do C++ no CSP vem sem linha, então o log diz em que passo foi
+local function step(P, name, fn, ...)
+  local ok, a, b = pcall(fn, ...)
+  if not ok then
+    log('carro peca', P.id, 'falhou em', name .. ':', tostring(a):sub(1, 300))
+    return false
+  end
+  return true, a, b
+end
+
+local function newPieceMesh(P, holder, m, verts, inds)
+  local nv, ni = #verts, #inds
+  local okV, vb = step(P, 'VertexBuffer', ac.VertexBuffer, nv)
+  if not okV or vb == nil then return nil end
+  local okF = step(P, 'copiar vertices', function()
+    local raw = vb.raw
+    for k = 0, nv - 1 do
+      local src = verts[k + 1]
+      local dst = raw ~= nil and raw[k] or vb:get(k + 1)
+      dst.pos.x, dst.pos.y, dst.pos.z = src.pos.x, src.pos.y, src.pos.z
+      dst.normal.x, dst.normal.y, dst.normal.z = src.normal.x, src.normal.y, src.normal.z
+      dst.uv.x, dst.uv.y = src.uv.x, src.uv.y
+      if raw == nil then vb:set(k + 1, dst) end
+    end
+  end)
+  if not okF then return nil end
+  local okI, ib = step(P, 'IndicesBuffer', ac.IndicesBuffer, ni)
+  if not okI or ib == nil then return nil end
+  local okG = step(P, 'copiar indices', function()
+    local raw = ib.raw
+    for k = 0, ni - 1 do if raw ~= nil then raw[k] = inds[k + 1] else ib:set(k + 1, inds[k + 1]) end end
+  end)
+  if not okG then return nil end
+  local matName = nil
+  if m.orig and m.orig.materialName then local okM, nm = pcall(m.orig.materialName, m.orig) if okM then matName = nm end
+  elseif m.ref.materialName then local okM, nm = pcall(m.ref.materialName, m.ref) if okM then matName = nm end end
+  local okC, mesh = step(P, 'createMesh', holder.createMesh, holder, 'CJ_DANO_' .. P.id .. '_' .. m.name, matName, vb, ib, false, false)
+  if not okC or mesh == nil or (mesh.empty and mesh:empty()) then return nil end
+  step(P, 'assignMaterialFrom', mesh.assignMaterialFrom, mesh, m.orig or m.ref)
+  return mesh
 end
 
 -- recorta a região das malhas da carroceria: devolve lista de { mesh (nova, no suporte), holder, W0 }
@@ -464,8 +513,9 @@ local function cutRegion(s, car, P)
   local plan = {}
   for _, m in ipairs(s.meshes) do
     if m.sr > 0.25 and load(m) then
-      local okI, ib = pcall(m.ref.getIndices, m.ref)
-      if okI and ib ~= nil and #ib >= 3 then
+      local src = m.orig or m.ref
+      local okI, ib = step(P, 'getIndices ' .. m.name, src.getIndices, src)
+      if okI and ib ~= nil and bufSize(ib) >= 3 then
         local W = meshWorld(m.ref)
         local T = W:clone():mul(T0)
         local inside = {}
@@ -481,67 +531,62 @@ local function cutRegion(s, car, P)
             if q.x < minX then minX = q.x end
           end
         end
-        local cutT, keepT = {}, {}
-        for t = 1, #ib, 3 do
-          local a, b, c = ib:get(t), ib:get(t + 1), ib:get(t + 2)
-          if inside[a] and inside[b] and inside[c] then cutT[#cutT + 1] = t else keepT[#keepT + 1] = t end
+        -- índices como números Lua; m.keep guarda o que sobrou de recortes anteriores
+        local all = m.keep
+        if all == nil then
+          all = {}
+          for k = 0, bufSize(ib) - 1 do all[k + 1] = tonumber(bufGet(ib, k)) end
         end
-        if #cutT >= 4 then plan[#plan + 1] = { m = m, ib = ib, cutT = cutT, keepT = keepT, W = W } end
+        local cutI, keepI = {}, {}
+        for t = 1, #all, 3 do
+          local a, b, c = all[t], all[t + 1], all[t + 2]
+          local dst = (inside[a] and inside[b] and inside[c]) and cutI or keepI
+          dst[#dst + 1] = a dst[#dst + 1] = b dst[#dst + 1] = c
+        end
+        if #cutI >= 12 then plan[#plan + 1] = { m = m, cutI = cutI, keepI = keepI, W = W } end
       end
     end
   end
-  if #plan == 0 then return nil end
+  if #plan == 0 then log('carro', s.index, P.id, 'sem triangulos na regiao') return nil end
   if P.check and not P.check(minY, maxX - minX) then
     log('carro', s.index, P.id, 'nao parece peca separada (ignorada)')
-    P.state = 3
     return nil
   end
   for _, pl in ipairs(plan) do
-    local m, ib = pl.m, pl.ib
-    -- peça: vértices usados pelos triângulos recortados
-    local map, vb, nv = {}, ac.VertexBuffer(), 0
-    local idx = ac.IndicesBuffer()
-    local verts, inds = {}, {}
-    for _, t in ipairs(pl.cutT) do
-      for k = 0, 2 do
-        local vi = ib:get(t + k)
-        if map[vi] == nil then
-          nv = nv + 1
-          map[vi] = nv - 1
-          verts[nv] = m.vb:get(vi + 1)
-        end
-        inds[#inds + 1] = map[vi]
+    local m = pl.m
+    -- peça: vértices usados pelos triângulos recortados (posição atual, já amassada)
+    local map, verts, inds = {}, {}, {}
+    for _, vi in ipairs(pl.cutI) do
+      if map[vi] == nil then
+        local j = 3 * vi
+        verts[#verts + 1] = { pos = vec3(m.p0[j] + m.d[j], m.p0[j + 1] + m.d[j + 1], m.p0[j + 2] + m.d[j + 2]),
+          normal = vec3(m.n0[j], m.n0[j + 1], m.n0[j + 2]), uv = m.vb:get(vi + 1).uv }
+        map[vi] = #verts - 1
       end
+      inds[#inds + 1] = map[vi]
     end
-    vb = ac.VertexBuffer(verts)
-    idx = ac.IndicesBuffer(inds)
     local holder = makeHolder(s, 'CJ_DANO_' .. P.id, pl.W)
     if holder then
-      local piece = holder:createMesh('CJ_DANO_' .. P.id .. '_' .. m.name, nil, vb, idx, false)
-      if piece then
-        pcall(piece.assignMaterialFrom, piece, m.ref)
-        pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone() }
-      else
-        holder:dispose()
-      end
+      local piece = newPieceMesh(P, holder, m, verts, inds)
+      if piece then pieces[#pieces + 1] = { mesh = piece, holder = holder, W0 = pl.W:clone() }
+      else pcall(holder.dispose, holder) end
     end
-    -- lataria sem a região: cópia com os triângulos que ficam; a original some
-    local rest = {}
-    for _, t in ipairs(pl.keepT) do rest[#rest + 1] = ib:get(t) rest[#rest + 1] = ib:get(t + 1) rest[#rest + 1] = ib:get(t + 2) end
-    local parent = m.ref:getParent()
-    if parent and #rest > 0 then
-      local nm = parent:createMesh('CJ_DANO_RESTO_' .. m.name, nil, m.vb:clone(), ac.IndicesBuffer(rest), false)
+    -- lataria sem a região: cópia com todos os vértices e só os triângulos que ficam; a original some
+    local parent = (m.orig or m.ref):getParent()
+    if parent and #pieces > 0 then
+      local all = {}
+      for k = 1, m.n do all[k] = m.vb:get(k) end
+      local nm = newPieceMesh({ id = 'resto' }, parent, m, all, pl.keepI)
       if nm then
-        pcall(nm.assignMaterialFrom, nm, m.orig or m.ref)
         m.orig = m.orig or m.ref
-        if m.ref ~= m.orig then pcall(m.ref.dispose, m.ref) end
-        m.orig:setVisible(false)
-        m.ref = nm
-        m.created = nm
+        if m.created then pcall(m.created.dispose, m.created) end
+        pcall(m.orig.setVisible, m.orig, false)
+        m.ref, m.created, m.keep = nm, nm, pl.keepI
       end
     end
   end
-  log(string.format('carro %d recortou %s: %d malhas', s.index, P.id, #pieces))
+  log(string.format('carro %d recortou %s: %d pecas', s.index, P.id, #pieces))
+  if #pieces == 0 then return nil end
   return pieces
 end
 
@@ -654,10 +699,12 @@ local function partsHit(s, car, hit, fresh)
         if P.state == 0 and P.dmg >= P.solta then
           P.state = 1
           if P.kind == 'region' then
-            P.pieces = cutRegion(s, car, P)
+            local okC, res = pcall(cutRegion, s, car, P)
+            if not okC then log('carro', s.index, P.id, 'erro no recorte:', tostring(res):sub(1, 300)) res = nil end
+            P.pieces = res
             if P.pieces then
               for _, pc in ipairs(P.pieces) do pc.rel0 = pc.W0:clone():mul(car.bodyTransform:inverse()) end
-            elseif P.state ~= 3 then P.state = 3 end
+            else P.state = 3 end
           end
           if P.state == 1 then log('carro', s.index, P.id, 'solta', string.format('%.0f', P.dmg)) end
         end
@@ -701,6 +748,7 @@ local function partsRestore(s)
       if m.created then pcall(m.created.dispose, m.created) end
       m.ref, m.orig, m.created = m.orig, nil, nil
     end
+    m.keep = nil
   end
   s.parts = nil
 end
@@ -947,7 +995,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v2 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v2.1 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 
 local function update(dt)
   sim = ac.getSim()
