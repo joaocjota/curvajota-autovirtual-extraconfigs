@@ -755,7 +755,8 @@ function followBody(F, dt)
   -- compensar, a peça anda junto com o carro (v3.4 pulava 0,5 s com a peça parada e ela "arrastava" atrás do carro).
   local T = b:getTransformation()
   if T == nil then return end
-  for _, it in ipairs(F.items) do setWorld(it.holder, it.rel:clone():mul(T)) end
+  if F.S then setWorld(F.S, T)
+  else for _, it in ipairs(F.items) do setWorld(it.holder, it.rel:clone():mul(T)) end end
 end
 
 local function boxLowY(Fw, mn, mx)
@@ -1040,12 +1041,30 @@ local function startFall(s, car, P, fresh)
     for _, it in ipairs(items) do pcall(it.holder.setVisible, it.holder, false) end
     F.hidden = true
   end
+  -- v3.5: a peça sai da árvore do carro e vai para uma esfera própria em carsRoot (fica parada no mundo; antes ela era
+  -- filha de um nó do carro e qualquer atraso de um quadro fazia a peça andar junto com o carro)
+  if fresh then
+    local okS, err = pcall(function()
+      local root = ac.findNodes('carsRoot:yes')
+      local Sph = root:createBoundingSphereNode('CJ_DANO_PECA_' .. s.index .. '_' .. P.id, 3)
+      holderParents[Sph] = root
+      setWorld(Sph, B0)
+      for _, it in ipairs(items) do
+        it.holder:setParent(Sph)
+        it.holder:getTransformationRaw():set(it.rel)
+        holderParents[it.holder] = Sph
+      end
+      F.S = Sph
+    end)
+    if not okS then log('carro', s.index, P.id, 'esfera falhou (fica no carro):', tostring(err):sub(1, 200)) end
+  end
   P.fall = F
   GONE_PIECES[#GONE_PIECES + 1] = { s = s, P = P }
   while #GONE_PIECES > cfg.maxPecas do
     local old = table.remove(GONE_PIECES, 1)
     if old.P.fall then
       for _, it in ipairs(old.P.fall.items) do pcall(it.holder.setVisible, it.holder, false) end
+      if old.P.fall.S then pcall(old.P.fall.S.setVisible, old.P.fall.S, false) end
       old.P.fall.hidden = true
       dropBody(old.P.fall)
     end
@@ -1081,8 +1100,9 @@ local function fallUpdate(s, P, dt)
   end
   M = M or mat4x4.translation(-F.c0):mul(mat4x4.rotation(F.ang, F.axis)):mul(mat4x4.translation(F.pos))
   F.M = M
-  for _, it in ipairs(F.items) do
-    setWorld(it.holder, it.W0:clone():mul(M))
+  if F.S then setWorld(F.S, F.B0:clone():mul(M))
+  else
+    for _, it in ipairs(F.items) do setWorld(it.holder, it.W0:clone():mul(M)) end
   end
   -- v3: assim que a peça sai de perto de todos os carros (no ar ou no chão), vira corpo físico
   if cfg.fisicaPecas == 1 and F.bmin and not F.noPhys then
@@ -1149,6 +1169,7 @@ local function partsRestore(s)
     else
       for _, pc in ipairs(P.pieces or {}) do pcall(pc.holder.dispose, pc.holder) end
     end
+    if P.fall and P.fall.S then pcall(P.fall.S.dispose, P.fall.S) end
   end
   for k = #GONE_PIECES, 1, -1 do if GONE_PIECES[k].s == s then table.remove(GONE_PIECES, k) end end
   for _, m in ipairs(s.meshes or {}) do
