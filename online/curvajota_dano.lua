@@ -53,6 +53,7 @@ local cfg = ac.configValues({
   furoGrip = 0.45,          -- perda de aderência no fim do esvaziamento (0 = nada, 1 = sem aderência)
   furoTmin = 30, furoTmax = 90,            -- segundos para esvaziar
   depurar = 0,              -- 1 = mostra a caixa de colisão das peças
+  espessura = 0.06,         -- espessura máxima da caixa de colisão de uma peça (m): chapa fina, não vira rampa
   log = 1,
 })
 
@@ -664,7 +665,7 @@ end
 -- do AC, um amassado (que vai para todos como uma batida comum) e, se a roda passar por cima, pode ter um FURO LENTO
 -- (o pneu perde aderência aos poucos em 30–90 s; a troca de pneus no box ou o reparo devolvem). Cada PC simula as peças
 -- dele: uma peça chutada pode parar em lugar um pouco diferente em cada PC.
-local MASSA = { porta_e = 16, porta_d = 16, capo = 9, parachoque_d = 7, parachoque_t = 7, asa = 6 }
+local MASSA = { porta_e = 12, porta_d = 12, capo = 7, parachoque_d = 5, parachoque_t = 5, asa = 5 }
 local SOLIDS = {}          -- peças com corpo físico: { s, P, F }
 local FURO = {}            -- índice do carro -> { [roda 0..3] = { t, T, g, motivo } , km = {...} }
 local pushHit = nil        -- definida mais abaixo (registra uma batida do próprio carro e manda pela rede)
@@ -1009,6 +1010,19 @@ local function startFall(s, car, P, fresh)
     B0 = carFrame() B0inv = B0:inverse()
     okBox, bmin, bmax = pcall(pieceBox, s, P, B0inv)
     if not okBox or bmin == nil or (bmax - bmin):length() > 8 then bmin, bmax = nil, nil end
+  end
+  if bmin then
+    -- v3.4: peça é chapa (capô, porta, para-choque, asa). A caixa das malhas fica gorda por causa da curva da chapa e
+    -- vira uma rampa: o carro passava por cima e subia (teste de 27/11, carro subiu no muro). O eixo mais fino da caixa
+    -- fica com no máximo cfg.espessura.
+    local d = bmax - bmin
+    local ax = 'x'
+    if d.y < d[ax] then ax = 'y' end
+    if d.z < d[ax] then ax = 'z' end
+    if d[ax] > cfg.espessura then
+      local c = (bmax[ax] + bmin[ax]) * 0.5
+      bmin[ax], bmax[ax] = c - cfg.espessura * 0.5, c + cfg.espessura * 0.5
+    end
   end
   if bmin then
     -- origem do quadro no centro da caixa: o corpo gira em volta do próprio centro (sem cog separado)
@@ -1411,7 +1425,7 @@ local function checkReset(i, s, car, dt)
 end
 
 local sessao = sim.currentSessionIndex
-log('v3.3 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
+log('v3.4 carregado; online:', online, 'mensagens:', sendHit ~= nil, 'physics.allowed:', tostring(physicsAllowed()))
 pcall(function()
   local q = mat4x4.translation(vec3(1, 0, 0)):mul(mat4x4.rotation(math.pi / 2, vec3(0, 1, 0))):transformPoint(vec3())
   log(string.format('convencao mul: T*R leva a origem para (%.2f, %.2f, %.2f)', q.x, q.y, q.z))
